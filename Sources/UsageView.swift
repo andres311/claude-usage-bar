@@ -41,7 +41,11 @@ struct UsageView: View {
             footer
         }
         .padding(14)
-        .frame(width: 320)
+        // 320 until the sessions list grew a memory column: at that width the folder name
+        // is the only flexible thing in the row, so it collapsed to "claude…ge-bar" while
+        // pid and uptime kept their full size. Widening is what keeps every column
+        // readable without dropping one.
+        .frame(width: 384)
     }
 
     private var header: some View {
@@ -59,11 +63,12 @@ struct UsageView: View {
     private var agentsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Label("Active agents", systemImage: "figure.run")
+                Label("Claude Code sessions", systemImage: "figure.run")
                     .font(.subheadline)
                     .labelStyle(.titleAndIcon)
                 Spacer()
-                Text("\(model.agents.count)")
+                Text(UsageModel.agentsChipText(total: model.agents.count,
+                                               active: model.agents.count(where: \.isActive)))
                     .font(.subheadline.monospacedDigit().weight(.medium))
                     .foregroundStyle(model.agents.isEmpty ? .secondary : .primary)
             }
@@ -74,24 +79,20 @@ struct UsageView: View {
             } else {
                 // Sorted by folder, then longest-running first: see AgentsMonitor.precedes.
                 ForEach(model.agents) { agent in
-                    HStack(spacing: 6) {
-                        Text(agent.folder.isEmpty ? "unknown folder" : agent.folder)
-                            .font(.caption)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Text(agent.host)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        Spacer()
-                        // verbatim: a pid is an identifier, never a formatted number.
-                        Text(verbatim: "#\(agent.id)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                        Text(agent.uptime)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
+                    AgentRow(agent: agent)
                 }
+                // The number behind "why is this machine slow". Same monospaced digits and
+                // trailing alignment as the column above it, so the two line up.
+                HStack(spacing: 6) {
+                    Text("\(model.agents.count) session\(model.agents.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(Fmt.memory(AgentsMonitor.totalMemory(model.agents)))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 2)
             }
         }
     }
@@ -213,6 +214,49 @@ private struct UpdatedLabel: View {
     }
 }
 
+/// One session in the list: whether it is working, where it is, and what it is holding.
+///
+/// The active marker is a filled dot and a full-strength folder name against a dimmed one,
+/// rather than a colour of its own. The panel already spends green, orange and red on
+/// limit severity, and a fourth meaning for colour here would read as a fourth kind of
+/// warning; "busy" is not a warning. It also survives the greyscale the menu bar and an
+/// accessibility setting can impose, which a hue would not.
+///
+/// The memory column is trailing and `monospacedDigit` for the same reason the menu bar
+/// is: a proportional digit changes width as the number moves and the whole column dances.
+private struct AgentRow: View {
+    let agent: AgentProcess
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(agent.isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.quaternary))
+                .frame(width: 5, height: 5)
+                .accessibilityLabel(agent.isActive ? "working" : "idle")
+            Text(agent.folder.isEmpty ? "unknown folder" : agent.folder)
+                .font(.caption)
+                .foregroundStyle(agent.isActive ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(agent.host)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 4)
+            // verbatim: a pid is an identifier, never a formatted number.
+            Text(verbatim: "#\(agent.id)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Text(agent.uptime)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Text(agent.memoryText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 52, alignment: .trailing)
+        }
+    }
+}
+
 /// A labelled progress bar with percentage and reset countdown.
 private struct BarRow: View {
     let row: UsageRow
@@ -259,9 +303,16 @@ enum LoginItem {
     /// while the app is running out of `build/` leaves a login item pointing at a
     /// directory `make clean` deletes. Only offer it from a real install location.
     static var isInstalled: Bool {
-        let path = Bundle.main.bundlePath
-        let applications = (NSHomeDirectory() as NSString).appendingPathComponent("Applications")
-        return ["/Applications", applications].contains { path.hasPrefix($0 + "/") }
+        isInstalled(bundlePath: Bundle.main.bundlePath, home: NSHomeDirectory())
+    }
+
+    /// The rule itself, with the two paths injected so it can be tested from anywhere but
+    /// an installed bundle. The trailing separator is what makes it a directory check
+    /// rather than a string prefix: without it `/Applications Backup/ClaudeUsage.app`
+    /// would pass for an install.
+    static func isInstalled(bundlePath: String, home: String) -> Bool {
+        let applications = (home as NSString).appendingPathComponent("Applications")
+        return ["/Applications", applications].contains { bundlePath.hasPrefix($0 + "/") }
     }
 
     static func set(_ on: Bool) {

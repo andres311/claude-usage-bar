@@ -2,34 +2,118 @@ import Foundation
 import SwiftUI
 
 // MARK: - API response (GET https://api.anthropic.com/api/oauth/usage)
+//
+// **Nothing here trusts the endpoint's shape.** It is undocumented and internal, so a field
+// that changes type, an entry that loses its `percent`, or `limits` arriving as an object
+// rather than an array all have to cost exactly what they touch and nothing more.
+// `Decodable`'s default behaviour is the opposite: one unreadable leaf throws all the way
+// to the top and the entire response is lost, including the half that parsed perfectly and
+// including the `five_hour`/`seven_day` fallback that exists for precisely this situation.
+//
+// So every container is decoded field by field through `lenient`, and `limits` element by
+// element through `Lenient`. A rename inside `extra_usage` costs the credits row; a broken
+// limit entry costs its own bar; neither costs the panel.
+
+/// `decodeIfPresent` that answers `nil` for a value of the wrong shape instead of throwing.
+/// Absent, null and unreadable are the same thing to this app: draw what arrived, leave out
+/// what did not.
+private extension KeyedDecodingContainer {
+    func lenient<T: Decodable>(_ type: T.Type, _ key: Key) -> T? {
+        (try? decodeIfPresent(type, forKey: key)) ?? nil
+    }
+}
+
+/// One element of an array, decoded on its own so a bad neighbour cannot take it down.
+///
+/// The unkeyed container advances past the element whether or not `T` could read it, which
+/// is what makes this work where a plain `[T]` decode does not: there, the first failure
+/// aborts the whole array.
+private struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+}
 
 struct UsageResponse: Decodable {
     let five_hour: UsageWindow?
     let seven_day: UsageWindow?
     let extra_usage: ExtraUsage?
     let limits: [LimitEntry]?
+
+    private enum CodingKeys: String, CodingKey {
+        case five_hour, seven_day, extra_usage, limits
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        five_hour = c.lenient(UsageWindow.self, .five_hour)
+        seven_day = c.lenient(UsageWindow.self, .seven_day)
+        extra_usage = c.lenient(ExtraUsage.self, .extra_usage)
+        limits = c.lenient([Lenient<LimitEntry>].self, .limits)?.compactMap(\.value)
+    }
 }
 
 struct UsageWindow: Decodable {
     let utilization: Double?
     let resets_at: String?
+
+    private enum CodingKeys: String, CodingKey { case utilization, resets_at }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        utilization = c.lenient(Double.self, .utilization)
+        resets_at = c.lenient(String.self, .resets_at)
+    }
 }
 
 struct LimitEntry: Decodable {
+    /// Missing or unreadable, and there is nothing to draw: this is the one field whose
+    /// absence drops the entry (through `Lenient`) rather than being tolerated.
+    let percent: Double
+    /// Defaulted rather than required. A renamed `kind` costs the row its title and its
+    /// place in the order, but the percentage is what the bar is for, so it still shows.
     let kind: String
     let group: String?
-    let percent: Double
     let severity: String?
     let resets_at: String?
     let scope: LimitScope?
     let is_active: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, group, percent, severity, resets_at, scope, is_active
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        percent = try c.decode(Double.self, forKey: .percent)
+        kind = c.lenient(String.self, .kind) ?? ""
+        group = c.lenient(String.self, .group)
+        severity = c.lenient(String.self, .severity)
+        resets_at = c.lenient(String.self, .resets_at)
+        scope = c.lenient(LimitScope.self, .scope)
+        is_active = c.lenient(Bool.self, .is_active)
+    }
 }
 
 struct LimitScope: Decodable {
     let model: ModelRef?
+
+    private enum CodingKeys: String, CodingKey { case model }
+
+    init(from decoder: Decoder) throws {
+        model = (try decoder.container(keyedBy: CodingKeys.self)).lenient(ModelRef.self, .model)
+    }
+
     struct ModelRef: Decodable {
         let id: String?
         let display_name: String?
+
+        private enum CodingKeys: String, CodingKey { case id, display_name }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = c.lenient(String.self, .id)
+            display_name = c.lenient(String.self, .display_name)
+        }
     }
 }
 
@@ -41,33 +125,50 @@ struct ExtraUsage: Decodable {
     let currency: String?
     let decimal_places: Int?
     let spend_limit_reached: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case is_enabled, monthly_limit, used_credits, utilization, currency,
+             decimal_places, spend_limit_reached
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        is_enabled = c.lenient(Bool.self, .is_enabled)
+        monthly_limit = c.lenient(Double.self, .monthly_limit)
+        used_credits = c.lenient(Double.self, .used_credits)
+        utilization = c.lenient(Double.self, .utilization)
+        currency = c.lenient(String.self, .currency)
+        decimal_places = c.lenient(Int.self, .decimal_places)
+        spend_limit_reached = c.lenient(Bool.self, .spend_limit_reached)
+    }
 }
 
 // MARK: - View model rows
 
 /// One value for the menu bar: a percentage plus the severity that belongs to it.
 ///
-/// The severity travels with the number on purpose. The chips used to re-derive it from
-/// the percentage alone, which silently dropped whatever `severity` the API had sent and
-/// left a chip green while the matching bar in the panel was already red.
+/// The two travel together on purpose. Anything that takes a bare percentage has to
+/// re-derive the severity from it, which silently drops whatever `severity` the API sent
+/// and leaves a chip green while the matching bar in the panel is red.
 struct Gauge {
+    /// Clamped on the way in, like `UsageRow.percent` and for the same reason: see
+    /// `Fmt.clampPercent`.
     let percent: Double
     let severity: Severity
 
     init(percent: Double, severity: Severity) {
-        self.percent = percent
+        self.percent = Fmt.clampPercent(percent)
         self.severity = severity
     }
 
     init(_ limit: LimitEntry) {
-        percent = limit.percent
-        severity = .from(apiValue: limit.severity, percent: limit.percent)
+        self.init(percent: limit.percent,
+                  severity: .from(apiValue: limit.severity, percent: limit.percent))
     }
 
     /// Fallback shape (`five_hour` / `seven_day`), which carries no severity of its own.
     init(utilization: Double) {
-        percent = utilization
-        severity = .from(apiValue: nil, percent: utilization)
+        self.init(percent: utilization, severity: .from(apiValue: nil, percent: utilization))
     }
 }
 
@@ -75,11 +176,24 @@ struct Gauge {
 struct UsageRow: Identifiable {
     let id: String
     let title: String
+    /// Clamped by the initializer rather than by every reader. The bar divides by it, the
+    /// chip converts it to an `Int` and the severity compares it, and a value straight off
+    /// the wire can be a number none of those three survive: see `Fmt.clampPercent`.
     let percent: Double
     let resetsAt: Date?
     let severity: Severity
     /// Extra text on the right of the title (e.g. "$64.20 / $100.00").
     let detail: String?
+
+    init(id: String, title: String, percent: Double, resetsAt: Date?,
+         severity: Severity, detail: String?) {
+        self.id = id
+        self.title = title
+        self.percent = Fmt.clampPercent(percent)
+        self.resetsAt = resetsAt
+        self.severity = severity
+        self.detail = detail
+    }
 }
 
 enum Severity: String {
@@ -132,13 +246,20 @@ enum Severity: String {
 // MARK: - Formatting helpers
 
 enum Fmt {
-    private static let iso: ISO8601DateFormatter = {
+    /// The two ISO formatters are shared instances of a non-`Sendable` class, so they are
+    /// guarded exactly like `currencyFormatter` below. They had no lock originally, on the
+    /// reasoning that `Fmt.date` is only ever reached from the panel's body: that is true
+    /// today and is not a property of this code, since nothing stops a `nonisolated static`
+    /// (`UsageModel.segments` is one) from calling it off the main actor tomorrow.
+    private static let isoLock = NSLock()
+
+    nonisolated(unsafe) private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
 
-    private static let isoNoFrac: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoNoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
@@ -146,6 +267,8 @@ enum Fmt {
 
     static func date(_ s: String?) -> Date? {
         guard let s else { return nil }
+        isoLock.lock()
+        defer { isoLock.unlock() }
         return iso.date(from: s) ?? isoNoFrac.date(from: s)
     }
 
@@ -160,8 +283,52 @@ enum Fmt {
         return "\(max(m, 1))m"
     }
 
+    /// "42%", from a number that is never assumed to be sane.
+    ///
+    /// **`Int(_: Double)` traps** - on NaN, and on anything outside `Int`'s range - and this
+    /// value arrives from an undocumented endpoint whose fields can change without notice.
+    /// A `percent` of `1e30` is valid JSON, decodes into a perfectly ordinary `Double`, and
+    /// then kills the app on the next menu bar redraw: the one crash a user is guaranteed
+    /// to see and has no way to explain. Clamping is the whole fix.
     static func percent(_ p: Double) -> String {
-        "\(Int(p.rounded()))%"
+        "\(Int(clampPercent(p).rounded()))%"
+    }
+
+    /// The widest percentage worth drawing. Past this it is a broken number rather than a
+    /// large one, and the bar has been pinned at full width for 99 screens already.
+    private static let percentCeiling: Double = 9999
+
+    /// A percentage safe to draw, compare, convert and divide by.
+    ///
+    /// Applied where percentages *enter* the app (`Gauge`, `UsageRow`) rather than where
+    /// they are printed, so the bar width, the severity comparison and the chip all get the
+    /// same sanitized value. NaN is caught before the comparisons rather than by them: it
+    /// has no ordering, so `min`/`max` would carry it straight through.
+    static func clampPercent(_ p: Double) -> Double {
+        guard !p.isNaN else { return 0 }
+        return min(max(p, 0), percentCeiling)
+    }
+
+    /// A process's memory as "137 MB" or "1.9 GB".
+    ///
+    /// **Whole megabytes under a gigabyte, on purpose.** A Claude Code session moves a few
+    /// hundred kilobytes constantly, so a decimal place there is a digit that twitches
+    /// once a second and says nothing - the same reason `humanElapsed` refuses to print
+    /// seconds. Past a gigabyte one decimal is back, because "1 GB" and "1.9 GB" are a
+    /// meaningfully different amount of trouble.
+    ///
+    /// Binary units, which is what `ri_phys_footprint` is measured in and what the system
+    /// `footprint` tool prints for the same process. The rounding happens before the unit
+    /// is chosen, so 1023.7 MB reads "1.0 GB" rather than "1024 MB".
+    ///
+    /// `locale` for the same reason `money` takes one: the decimal separator is a comma in
+    /// half the world, and a test asserting "1.9 GB" against the machine's own locale
+    /// passes here and fails there.
+    static func memory(_ bytes: UInt64, locale: Locale = .current) -> String {
+        let mb = (bytes + 524_288) / 1_048_576          // rounded, not truncated
+        if mb < 1024 { return "\(mb) MB" }
+        let gb = Double(bytes) / 1_073_741_824
+        return String(format: "%.1f GB", locale: locale, gb)
     }
 
     /// Converts minor units + decimal_places into "$64.20".
@@ -236,9 +403,9 @@ extension UsageResponse {
             // account it comes back `false` on limits that plainly exist (a session at
             // 45% with a reset time in the future, and the weekly Fable limit at 65%)
             // and `true` on exactly one entry, the highest of the three. It reads as
-            // "this is the limit currently binding", not "the account has this limit" -
-            // filtering on it collapsed the whole panel down to a single bar.
-            // Limits the account does not have are simply absent from the array.
+            // "this is the limit currently binding", not "the account has this limit", so
+            // filtering on it collapses the whole panel down to a single bar. Limits the
+            // account does not have are simply absent from the array.
             //
             // Sorting the offsets alongside keeps equal ranks in the order the API sent
             // them: `sorted(by:)` is not stable, so without it two scoped weeklies could
@@ -334,7 +501,10 @@ extension UsageResponse {
         case "weekly_all": return "Weekly (all models)"
         case "weekly_scoped": return "Weekly (scoped)"
         default:
-            return l.kind.replacingOccurrences(of: "_", with: " ").capitalized
+            // `kind` defaults to "" when the endpoint stops sending it, and an untitled
+            // bar reads as a rendering bug rather than as a limit nobody named.
+            let spelled = l.kind.replacingOccurrences(of: "_", with: " ").capitalized
+            return spelled.isEmpty ? "Limit" : spelled
         }
     }
 }
