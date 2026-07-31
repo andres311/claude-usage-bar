@@ -36,8 +36,6 @@ final class UsageModel: ObservableObject {
     @Published private(set) var agents: [AgentProcess] = []
     /// Set while the API is rate limiting us (429 + Retry-After).
     @Published private(set) var throttledUntil: Date?
-    /// True while the popover is on screen. `now` only drives the countdowns inside the
-    /// panel, so the 1 Hz clock is parked while nothing is looking at it.
     /// True while an `NSMenu` is tracking. Deliberately **not** `@Published`: publishing
     /// it would trigger the exact rebuild it exists to prevent. Everything that would
     /// otherwise publish on a timer parks while this is set, so the menu's items stay put
@@ -49,10 +47,20 @@ final class UsageModel: ObservableObject {
         }
     }
 
+    /// True while the popover is on screen. The clock only drives the countdowns inside
+    /// the panel, so it runs for exactly as long as this is set.
     @Published var panelVisible = false {
         didSet {
-            guard panelVisible, !oldValue else { return }
+            guard panelVisible != oldValue else { return }
+            guard panelVisible else {
+                // Nothing is counting down: stop the loop rather than leave it waking up
+                // once a second for the rest of the day (see `startClock`).
+                tickTask?.cancel()
+                tickTask = nil
+                return
+            }
             clock.tick()
+            startClock()
             // The scan is skipped while nothing displays it (see `start`), so the list
             // could be minutes old by the time the panel opens.
             scanAgentsNow()
@@ -115,54 +123,105 @@ final class UsageModel: ObservableObject {
     /// expired" message off the panel: the token is still expired, and losing the text
     /// also loses the `!` chip, which is the only thing saying the numbers are stale.
     private var authExpired = false
-    /// How often the process table is scanned. This is a local `ps` (plus an `lsof` for
-    /// pids never seen before, which is cached), so it is rate limited by nothing and has
-    /// no business sharing a cadence with the API: it runs in its own loop precisely so a
-    /// 15 minute usage interval cannot leave a session that ended on screen for 15
-    /// minutes.
+    /// How often the process table is scanned. This is a local `libproc` walk, so it is
+    /// rate limited by nothing and has no business sharing a cadence with the API: it runs
+    /// in its own loop precisely so a 15 minute usage interval cannot leave a session that
+    /// ended on screen for 15 minutes.
     ///
-    /// The two cadences are far apart because only one of them is the steady state.
-    /// Measured with `getrusage` over `RUSAGE_SELF` + `RUSAGE_CHILDREN` on a table of ~860
-    /// processes, a warm scan costs **~33 ms of CPU** - almost all of it forking `ps` and
-    /// having it format every process on the machine, so it does not get cheaper with
-    /// fewer agents. That is 3.3% of a core once a second, which is fine for the seconds a
-    /// popover is on screen and indefensible for an app that sits in the menu bar all day.
-    /// Hence 10s whenever only the chip needs the count: ~12 s of CPU per hour.
-    ///
-    /// If the chip ever needs to be quicker than this, the way to buy it is a cheaper
-    /// scan, not a shorter timer. `pgrep -f claude` costs ~6 ms and its pid set is a strict
-    /// superset of what `isClaude` accepts (both gate on the literal "claude" appearing in
-    /// the arguments), so it can decide whether the full `ps` is worth running at all.
-    static let agentScanInterval: TimeInterval = 10
-    static let agentScanIntervalPanelOpen: TimeInterval = 1
+    /// The two cadences differ by what is watching, not by what a scan costs: at ~3 ms on
+    /// a 750-process table the slow one spends about 0.4 s of CPU per hour and the fast one
+    /// about a millisecond per tick. They are deliberately unhurried anyway - a count in
+    /// the menu bar being half a minute stale is invisible, and the panel already scans the
+    /// moment it opens (`scanAgentsNow`), so the interval below only governs how a session
+    /// that ends *while you are looking* disappears.
+    static let agentScanInterval: TimeInterval = 30
+    static let agentScanIntervalPanelOpen: TimeInterval = 10
     /// The usage endpoint rate limits per 5-minute window, so keep a floor
     /// between requests no matter what the user picks.
-    static let minFetchGap: TimeInterval = 25
+    nonisolated static let minFetchGap: TimeInterval = 25
     /// First step of the 429 backoff, doubled per consecutive 429. The endpoint answers
     /// `Retry-After: 0` while it is still refusing requests (measured: 429 on all 12 of
     /// 12 probes over 5.5 minutes, every response carrying that header), so honoring it
     /// literally just retries into the same window.
-    static let minThrottle: TimeInterval = 60
+    nonisolated static let minThrottle: TimeInterval = 60
     /// Ceiling for the 429 backoff, so neither the doubling nor a bogus `Retry-After`
     /// can park the app forever.
-    static let maxThrottle: TimeInterval = 900
+    nonisolated static let maxThrottle: TimeInterval = 900
 
     static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     static let usagePageURL = URL(string: "https://claude.ai/settings/usage")!
 
-    /// RFC 7231 date, the other form `Retry-After` is allowed to take.
-    private static let httpDate: DateFormatter = {
+    // MARK: - Backoff arithmetic
+    //
+    // Static and `nonisolated` so `Tests/main.swift` can exercise the 429 policy without a
+    // request, a network or the main actor. The model holds the state; these decide what
+    // it means.
+
+    /// `Retry-After` in seconds. Either a number of seconds or an RFC 7231 date, and in
+    /// practice usually the literal `0` the endpoint sends while it is still refusing
+    /// requests, hence a lower bound rather than the answer (see `throttleDelay`).
+    ///
+    /// The formatter is built per call on purpose: it is only reachable from a 429, which
+    /// arrives minutes apart at most, and a cached one would either be main-actor isolated
+    /// state reached from a `nonisolated` context or a mutable global shared across tasks.
+    nonisolated static func retryAfterSeconds(_ header: String?, now: Date) -> TimeInterval {
+        let header = (header ?? "").trimmingCharacters(in: .whitespaces)
+        if let seconds = Double(header) { return seconds }
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(identifier: "GMT")
         f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return f
-    }()
+        guard let date = f.date(from: header) else { return 0 }
+        return date.timeIntervalSince(now)
+    }
+
+    /// How long to stop asking after a 429, given how many landed in a row.
+    ///
+    /// Doubles from `minThrottle`: 60s, 2m, 4m, 8m, then `maxThrottle`. A single blip
+    /// recovers on the next tick, while a sustained window stops being hammered, which
+    /// matters because retrying inside the window appears to hold it open. `advertised` is
+    /// only ever a floor: honoring `Retry-After: 0` literally would retry straight back
+    /// into the same window. The exponent is capped at 8 so a long outage cannot overflow
+    /// it; `maxThrottle` has already flattened the result well before that.
+    nonisolated static func throttleDelay(consecutive429: Int,
+                                          advertised: TimeInterval) -> TimeInterval {
+        let n = min(max(consecutive429, 1), 8)
+        let floor = minThrottle * pow(2, Double(n - 1))
+        return min(max(advertised, floor), maxThrottle)
+    }
+
+    /// How long the poll loop sleeps next.
+    ///
+    /// Normally the user's interval, but a running backoff shortens it to just past the
+    /// moment it expires. Sleeping the full interval instead means the panel counts
+    /// "retry in 4m" down to zero and then sits there for the rest of a 15 minute cycle,
+    /// which reads as the backoff being stuck.
+    nonisolated static func pollDelay(refreshInterval: TimeInterval,
+                                      throttledUntil: Date?,
+                                      now: Date) -> TimeInterval {
+        guard let until = throttledUntil else { return refreshInterval }
+        let wait = until.timeIntervalSince(now)
+        guard wait > 0 else { return min(refreshInterval, minFetchGap) }
+        return min(refreshInterval, wait + 1)
+    }
+
+    /// The earliest moment a request would actually go out: the floor between requests and
+    /// a running backoff, whichever is later.
+    nonisolated static func fetchAllowedAt(lastAttempt: Date?, throttledUntil: Date?) -> Date? {
+        [lastAttempt?.addingTimeInterval(minFetchGap), throttledUntil].compactMap { $0 }.max()
+    }
+
+    /// What a fresh install polls at, before anyone touches the gear menu.
+    ///
+    /// 5 minutes rather than 1: the numbers move slowly, the endpoint rate limits per
+    /// 5-minute window, and this is the one interval that runs unattended for months. The
+    /// menu is where someone who wants it quicker says so.
+    static let defaultRefreshInterval: TimeInterval = 300
 
     init() {
         let defaults = UserDefaults.standard
         let stored = defaults.double(forKey: Keys.interval)
-        refreshInterval = stored > 0 ? max(stored, Self.minFetchGap) : 60
+        refreshInterval = stored > 0 ? max(stored, Self.minFetchGap) : Self.defaultRefreshInterval
         titleMode = TitleMode(rawValue: defaults.string(forKey: Keys.titleMode) ?? "")
             ?? .sessionAndWeek
         showAgents = defaults.object(forKey: Keys.showAgents) as? Bool ?? true
@@ -188,22 +247,36 @@ final class UsageModel: ObservableObject {
                 // nothing else cancels it.
                 guard let self else { return }
                 // Only scan while something is actually showing the result: the panel is
-                // open, or the menu bar carries the agents chip. Otherwise this is a `ps`
-                // over the whole process table feeding a list nobody can see. Publishing
-                // the result would also rebuild an open gear menu, hence `menuTracking`.
+                // open, or the menu bar carries the agents chip. Otherwise this is a walk
+                // of the whole process table feeding a list nobody can see. Publishing the
+                // result would also rebuild an open gear menu, hence `menuTracking`.
                 if !self.menuTracking, self.panelVisible || self.showAgents {
-                    self.applyScan(await AgentsMonitor.scan())
+                    await self.scanAndApply()
                 }
                 try? await Task.sleep(for: .seconds(self.panelVisible
                                                     ? Self.agentScanIntervalPanelOpen
                                                     : Self.agentScanInterval))
             }
         }
+        // No clock here: it starts with the panel. See `startClock`.
+    }
+
+    /// The 1 Hz clock, tied to `panelVisible` rather than started once and left running.
+    ///
+    /// The countdowns it drives exist only inside the popover, so outside it every tick is
+    /// a wakeup that tests a boolean and goes back to sleep. The CPU cost of that is nil
+    /// and the wakeups are not: 86 400 a day on a process with nothing to do is what keeps
+    /// a laptop out of its deep idle states.
+    ///
+    /// Sleeps first, because opening the panel has already ticked it.
+    private func startClock() {
+        tickTask?.cancel()
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                if self.panelVisible, !self.menuTracking { self.clock.tick() }
                 try? await Task.sleep(for: .seconds(1))
+                // Also stops the loop if the model went away underneath it.
+                guard let self, self.panelVisible else { return }
+                if !self.menuTracking { self.clock.tick() }
             }
         }
     }
@@ -219,24 +292,71 @@ final class UsageModel: ObservableObject {
     private func scanAgentsNow() {
         scanTask?.cancel()
         scanTask = Task { [weak self] in
-            let found = await AgentsMonitor.scan()
-            guard !Task.isCancelled else { return }
-            self?.applyScan(found)
+            guard let self else { return }
+            await self.scanAndApply()
         }
     }
 
+    /// One scan, stamped with the moment its counters were read.
+    ///
+    /// The stamp is taken here rather than inside `applyScan` because the two are not the
+    /// same instant when two scans overlap, and the CPU arithmetic downstream divides by the
+    /// difference between them.
+    private func scanAndApply() async {
+        let found = await AgentsMonitor.scan()
+        guard !Task.isCancelled else { return }
+        applyScan(found, takenAt: Date())
+    }
+
+    /// The previous scan and when it was taken, which is what turns a CPU counter into a
+    /// rate. Held here rather than in `AgentsMonitor` so that stays a stateless enum and
+    /// the classifier stays a pure function (see `AgentsMonitor.classify`).
+    ///
+    /// This is the *unclassified* scan, since the raw counters are the baseline the next
+    /// delta is measured from.
+    private var previousScan: [AgentProcess] = []
+    private var previousScanAt: Date?
+    /// Per pid, the instant it was last seen above the activity threshold. The hysteresis
+    /// clock; `classify` prunes it.
+    private var activeSince: [Int32: Date] = [:]
+
     /// Publishes a scan result, filtering the two ways a scan can be worse than no scan.
     ///
-    /// `nil` means the scan itself failed (`ps` missing, or killed by its watchdog), which
-    /// is not the same as "no agents are running": emptying the list on it would blink
-    /// every session off the panel and out of the menu bar for a beat and then back.
+    /// `nil` means the scan itself failed, which is not the same as "no agents are
+    /// running": emptying the list on it would blink every session off the panel and out
+    /// of the menu bar for a beat and then back.
     ///
     /// An unchanged list is dropped rather than assigned, because assigning publishes, and
-    /// at one scan a second while the panel is open that is `UsageView.body` re-running on
-    /// a timer for an identical picture - the thing the separate `Clock` exists to avoid.
-    private func applyScan(_ found: [AgentProcess]?) {
-        guard let found, !AgentsMonitor.sameOnScreen(found, agents) else { return }
-        agents = found
+    /// at one scan every ten seconds while the panel is open that is `UsageView.body`
+    /// re-running on a timer for an identical picture - the thing the separate `Clock`
+    /// exists to avoid.
+    ///
+    /// The `dt` handed to the classifier is **measured, never assumed**. The nominal
+    /// cadence is 10s or 30s, but it changes when the panel opens, the loop parks entirely
+    /// while a menu is tracking, and a machine that went to sleep comes back with hours on
+    /// the clock. `classify` throws out a window it cannot trust.
+    private func applyScan(_ found: [AgentProcess]?, takenAt: Date) {
+        guard let found else { return }
+        // Two scans can be in flight at once - the loop's, and the off-cycle one the panel
+        // fires as it opens - and nothing says they finish in the order they started.
+        // Applying the older one second would file its stale counters under a fresh
+        // timestamp, and the next `dt` would then be shorter than the CPU it divides: a
+        // burst of activity that never happened. The older result is simply dropped, since
+        // by definition the newer one already says everything it did.
+        if let previousScanAt, takenAt <= previousScanAt { return }
+        let now = takenAt
+        let result = AgentsMonitor.classify(
+            previous: previousScan,
+            current: found,
+            dt: previousScanAt.map { now.timeIntervalSince($0) },
+            activeSince: activeSince,
+            now: now)
+        previousScan = found
+        previousScanAt = now
+        activeSince = result.activeSince
+
+        guard !AgentsMonitor.sameOnScreen(result.agents, agents) else { return }
+        agents = result.agents
     }
 
     private func restartTimer() {
@@ -253,29 +373,24 @@ final class UsageModel: ObservableObject {
         }
     }
 
-    /// Normally the user's interval, but a running 429 backoff shortens it to just past
-    /// the moment it expires. Sleeping the full interval instead means the panel counts
-    /// "retry in 4m" down to zero and then sits there for the rest of a 15 minute cycle,
-    /// which reads as the backoff being stuck.
     private var nextPollDelay: TimeInterval {
-        guard let until = throttledUntil else { return refreshInterval }
-        let wait = until.timeIntervalSinceNow
-        guard wait > 0 else { return min(refreshInterval, Self.minFetchGap) }
-        return min(refreshInterval, wait + 1)
+        Self.pollDelay(refreshInterval: refreshInterval, throttledUntil: throttledUntil,
+                       now: Date())
     }
 
     /// The earliest moment a request would actually go out, so the panel can disable its
-    /// refresh button instead of dropping the click. Covers both the floor between
-    /// requests and a running 429 backoff.
+    /// refresh button instead of dropping the click.
     var nextFetchAllowedAt: Date? {
-        [lastAttempt?.addingTimeInterval(Self.minFetchGap), throttledUntil]
-            .compactMap { $0 }.max()
+        Self.fetchAllowedAt(lastAttempt: lastAttempt, throttledUntil: throttledUntil)
     }
 
-    /// The floor applies to a user-initiated refresh as well. It used to be bypassable
-    /// from the panel's button, which made clicking it repeatedly the one supported way to
-    /// walk straight into the endpoint's 5-minute 429 window - and retrying inside that
-    /// window is what holds it open. The button is disabled until this allows a request.
+    /// Fetches the usage, or returns having done nothing if it is too soon.
+    ///
+    /// **The floor applies to a user-initiated refresh too, and there is deliberately no
+    /// way past it.** A button that could bypass it makes clicking repeatedly the fastest
+    /// supported way into the endpoint's 5-minute 429 window, and retrying inside that
+    /// window is what holds it open. `RefreshButton` disables itself until
+    /// `nextFetchAllowedAt`, so the click is refused visibly rather than dropped here.
     func refresh() async {
         guard !isLoading else { return }
         if let allowed = nextFetchAllowedAt, Date() < allowed { return }
@@ -304,44 +419,52 @@ final class UsageModel: ObservableObject {
                 usage = try JSONDecoder().decode(UsageResponse.self, from: data)
                 lastUpdated = Date()
                 errorText = nil
-                throttledUntil = nil
-                consecutive429 = 0
                 authExpired = false
+                clearThrottle()
                 UserDefaults.standard.set(data, forKey: Keys.cachedUsage)
                 UserDefaults.standard.set(lastUpdated, forKey: Keys.cachedAt)
             case 401, 403:
                 // Claude Code refreshes the token itself; we just wait for it.
                 authExpired = true
                 errorText = "Session expired. Open Claude Code to refresh the login."
+                clearThrottle()
             case 429:
                 // Back off and keep showing the last known numbers.
-                let header = ((response as? HTTPURLResponse)?
-                    .value(forHTTPHeaderField: "Retry-After") ?? "")
-                    .trimmingCharacters(in: .whitespaces)
-                // Retry-After is either a number of seconds or an HTTP date.
-                let advertised = Double(header)
-                    ?? Self.httpDate.date(from: header)?.timeIntervalSinceNow
-                    ?? 0
-                // Capped at 8: `maxThrottle` already clamps the result, so anything past
-                // the fourth doubling is the same wait. The cap just keeps the exponent
-                // below from running away over a long outage.
+                let now = Date()
+                let advertised = Self.retryAfterSeconds(
+                    (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After"),
+                    now: now)
                 consecutive429 = min(consecutive429 + 1, 8)
-                // Doubling floor: 60s, 2m, 4m, 8m, then maxThrottle. A single blip
-                // recovers on the next tick, while a sustained window stops being
-                // hammered - retrying inside it appears to hold it open.
-                let floor = Self.minThrottle * pow(2, Double(consecutive429 - 1))
-                throttledUntil = Date().addingTimeInterval(
-                    min(max(advertised, floor), Self.maxThrottle))
+                throttledUntil = now.addingTimeInterval(
+                    Self.throttleDelay(consecutive429: consecutive429, advertised: advertised))
                 // Being throttled is shown by the footer's countdown, not as an error -
                 // but only a 200 is evidence the login came back, so an expired session
                 // keeps its message and its `!` chip through the backoff.
                 if !authExpired { errorText = nil }
             default:
                 errorText = "HTTP \(code)"
+                clearThrottle()
             }
         } catch {
-            errorText = error.localizedDescription
+            // Same rule as the 429 branch, for the same reason: only a 200 is evidence the
+            // login came back, so a network blip must not wipe the "session expired" text
+            // and with it the `!` chip - the one thing on the menu bar saying the numbers
+            // have stopped being true. A failed request is also no evidence the rate limit
+            // window closed, so the backoff is left exactly as it was.
+            if !authExpired { errorText = error.localizedDescription }
         }
+    }
+
+    /// Ends the 429 backoff, for any answer that is not a 429.
+    ///
+    /// Getting an HTTP status at all - 401, 500, anything - proves the endpoint is no longer
+    /// refusing us, so the doubling has to start over. Left as it was, a 401 arriving after
+    /// a couple of 429s kept the app on an 8 minute cadence for as long as the counter said
+    /// so, long after the window it was counting had closed. A network error is *not* such
+    /// evidence and deliberately does not come through here.
+    private func clearThrottle() {
+        throttledUntil = nil
+        consecutive429 = 0
     }
 
     // MARK: - Menu bar title
@@ -349,11 +472,26 @@ final class UsageModel: ObservableObject {
     /// The chips shown next to the mark, in order. `StatusIcon` turns these into the
     /// status item image.
     func statusSegments() -> [StatusIcon.Segment] {
+        Self.segments(usage: usage, titleMode: titleMode, errorText: errorText,
+                      agentCount: agents.count,
+                      activeAgentCount: agents.count(where: \.isActive),
+                      showAgents: showAgents)
+    }
+
+    /// The chip list, as a function of the six things that decide it and nothing else.
+    /// `nonisolated` and taking counts rather than the agents themselves so the rules
+    /// above can be tested without a model, a fetch or the main actor.
+    nonisolated static func segments(usage: UsageResponse?,
+                                     titleMode: TitleMode,
+                                     errorText: String?,
+                                     agentCount: Int,
+                                     activeAgentCount: Int = 0,
+                                     showAgents: Bool) -> [StatusIcon.Segment] {
         var out: [StatusIcon.Segment] = []
 
-        // The gauge carries the severity the API sent, so a chip and the bar it mirrors in
-        // the panel always agree. Re-deriving it from the percentage alone used to drop an
-        // early escalation on the floor: a limit the API called critical stayed green.
+        // Takes the whole `Gauge`, never a bare percentage: the severity has to come from
+        // the same value the panel's bar reads, or an escalation the API sent at a low
+        // percentage is dropped and the chip stays green next to a red bar.
         func chip(_ gauge: Gauge?) -> StatusIcon.Segment? {
             guard let gauge else { return nil }
             return StatusIcon.Segment(text: Fmt.percent(gauge.percent), severity: gauge.severity)
@@ -377,8 +515,11 @@ final class UsageModel: ObservableObject {
                 if let c = chip(usage.session) { out.append(c) }
                 if let c = chip(usage.weekly) { out.append(c) }
             }
-        } else if errorText == nil {
-            // Nothing fetched yet: one chip carries the state.
+        } else if errorText == nil, titleMode != .iconOnly {
+            // Nothing fetched yet: one chip carries the state until the first response
+            // lands. Not in "Icon only", where the whole point is that no chip appears -
+            // and unlike the `!` below this one is not a warning, so there is nothing lost
+            // by honoring the setting.
             out.append(StatusIcon.Segment(text: "…", severity: .normal))
         }
 
@@ -389,12 +530,25 @@ final class UsageModel: ObservableObject {
             out.append(StatusIcon.Segment(text: "!", severity: .critical))
         }
 
-        if showAgents, !agents.isEmpty {
-            out.append(StatusIcon.Segment(text: "\(agents.count)",
+        if showAgents, agentCount > 0 {
+            out.append(StatusIcon.Segment(text: agentsChipText(total: agentCount,
+                                                              active: activeAgentCount),
                                           severity: .normal,
                                           symbol: "figure.run"))
         }
         return out
+    }
+
+    /// "3/7" when some sessions are working and others are only open, "7" when the
+    /// distinction would say nothing.
+    ///
+    /// A bare number for "all of them are busy" and for a single session, because "7/7"
+    /// and "1/1" spend menu bar width to tell you nothing. Everything else earns the
+    /// fraction: a machine with seven sessions open and one actually running is the case
+    /// this whole feature exists for.
+    nonisolated static func agentsChipText(total: Int, active: Int) -> String {
+        guard total > 1, active < total else { return "\(total)" }
+        return "\(active)/\(total)"
     }
 }
 
@@ -431,7 +585,11 @@ enum Credentials {
         return p.terminationStatus == 0 ? data : nil
     }
 
-    private static func parse(_ data: Data) -> String? {
+    /// Pulls `claudeAiOauth.accessToken` out of the credentials blob. Internal rather than
+    /// private so the tests can cover the shapes that must yield nothing: the token is the
+    /// one secret this app touches, and an empty or malformed one has to read as "no
+    /// credentials" rather than as a `Bearer ` header with nothing behind it.
+    static func parse(_ data: Data) -> String? {
         guard
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let oauth = root["claudeAiOauth"] as? [String: Any],
