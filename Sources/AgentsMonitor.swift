@@ -187,7 +187,10 @@ enum AgentsMonitor {
     /// comes back updated. Entries for pids that are gone are dropped, which is also what
     /// keeps pid reuse from inheriting a verdict.
     ///
-    /// - Parameter dt: seconds since `previous` was taken, or `nil` on the first scan.
+    /// - Parameter dt: seconds since `previous` was taken, or `nil` on the first scan. A
+    ///   window outside `minSampleWindow...maxSampleWindow` is discarded rather than
+    ///   divided by, and discarded means *nothing is concluded* for the pids it covers -
+    ///   see the middle case in `load`.
     static func classify(previous: [AgentProcess],
                          current: [AgentProcess],
                          dt: TimeInterval?,
@@ -203,7 +206,8 @@ enum AgentsMonitor {
         out.reserveCapacity(current.count)
 
         for var agent in current {
-            if let load = load(agent: agent, previous: before[agent.id], dt: usable ? dt : nil),
+            if let load = load(agent: agent, previous: before[agent.id],
+                               dt: dt, windowUsable: usable),
                load >= activeThreshold {
                 since[agent.id] = now
             }
@@ -221,20 +225,32 @@ enum AgentsMonitor {
 
     /// Fraction of a core this session has been using, or `nil` when it cannot be told.
     ///
-    /// With a usable window it is the honest answer: CPU spent divided by time passed.
-    /// Without one - the first scan after launch, a pid seen for the first time, or a
-    /// window this function was told not to trust - it falls back to the process's
-    /// lifetime average, which is the only thing a single sample can support. That
-    /// fallback is an approximation and reads low for a session that has been idle for
-    /// hours and just started working, but it beats reporting nothing at all for the first
-    /// scan and it corrects itself on the next one.
+    /// Three cases, and the middle one is why `windowUsable` is a parameter of its own
+    /// rather than being folded into a `nil` `dt`:
+    ///
+    /// - **A baseline and a window worth dividing by**: the honest answer, CPU spent over
+    ///   time passed.
+    /// - **A baseline and a window that is not**: `nil`. Nothing is measured and nothing is
+    ///   claimed; the hysteresis in `classify` goes on holding the last real verdict. This
+    ///   must *not* fall through to the lifetime average below, and that is not a
+    ///   hypothetical: waking a laptop puts hours on `dt`, and a session that worked hard
+    ///   this morning and has been parked at the prompt since carries a lifetime average
+    ///   well over the threshold. Substituting it lights up every such session for a full
+    ///   grace period while they burn nothing at all. Measured on a live table, three of
+    ///   fifteen sessions were above 2% on their lifetime average alone.
+    /// - **No baseline at all** - the first scan after launch, a pid seen for the first
+    ///   time, or a counter that went backwards because the pid was reused: the lifetime
+    ///   average, which is the only thing one sample can support. It reads low for a
+    ///   session idle for hours that just started working and corrects itself on the next
+    ///   scan, which beats reporting nothing for the first ten seconds after launch.
     private static func load(agent: AgentProcess, previous: AgentProcess?,
-                             dt: TimeInterval?) -> Double? {
-        if let previous, let dt, agent.cpuNanos >= previous.cpuNanos {
+                             dt: TimeInterval?, windowUsable: Bool) -> Double? {
+        // A counter that went backwards means this pid is a different process now, so what
+        // was sampled under it is no baseline: fall through to the lifetime average.
+        if let previous, agent.cpuNanos >= previous.cpuNanos {
+            guard windowUsable, let dt else { return nil }
             return Double(agent.cpuNanos - previous.cpuNanos) / 1e9 / dt
         }
-        // A counter that went backwards means this pid is a different process now, so the
-        // lifetime average is the right answer for it too.
         guard agent.elapsed >= 1 else { return nil }
         return Double(agent.cpuNanos) / 1e9 / agent.elapsed
     }

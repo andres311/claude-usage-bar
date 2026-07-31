@@ -49,7 +49,8 @@ The memory column is the same number Activity Monitor shows in its "Memory" colu
 The session list has nothing to do with the usage refresh interval. Reading it is a local
 walk of the process table, so nothing rate limits it and it runs on its own cycle: every
 ten seconds while the panel is open, every thirty while only the menu bar count is
-showing, and it scans immediately when the panel opens. A session you close leaves the
+showing, not at all while nothing is displaying it, and immediately the moment either one
+comes back (so the list is never stale on arrival). A session you close leaves the
 panel while you watch it happen, whether the usage numbers are set to refresh once a
 minute or once every fifteen.
 
@@ -135,8 +136,8 @@ The usage endpoint is rate limited per 5-minute window and answers `429` with a
   way into the 5-minute window, and retrying inside that window keeps it open;
 - the agent count is on a separate loop with no connection to the interval above: every ten
   seconds while the panel is open, every thirty while only the menu bar chip shows it, and
-  not at all while nothing does (it also scans immediately when the panel opens, so the
-  list is never stale on arrival). It reads the process table directly through
+  not at all while nothing does - the loop stops rather than idles, and restarts with an
+  immediate scan, so the list is never stale on arrival. It reads the process table through
   `libproc`, so no server has an opinion about it and it costs ~3ms of CPU per scan, or
   about a second per hour at the slower rate. It used to fork `ps` and one `lsof` per
   agent, which was ten times that and was the app's entire CPU footprint;
@@ -161,14 +162,14 @@ Sources/
 Resources/
   claude-mark.png      the menu bar mark, copied into the .app at build time
 Tests/
-  main.swift           255 logic checks, `make test`
+  main.swift           268 logic checks, `make test`
 docs/                  the screenshots on this page (folder names painted over)
 build.sh               compiles both arches, lipos, bundles and ad-hoc signs the .app
 Makefile               build / test / install / run / zip / clean / uninstall
 ```
 
 `make test` compiles every source except `App.swift` together with `Tests/main.swift` into
-a plain command line binary and runs it: 255 checks in about a second. No XCTest and no
+a plain command line binary and runs it: 268 checks in about a second. No XCTest and no
 test target, for the same reason there is no Xcode project.
 
 It covers the parts that are easy to get quietly wrong: which processes count as an agent
