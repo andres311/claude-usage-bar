@@ -268,8 +268,9 @@ suite("AgentsMonitor.classify") {
                                   activeSince: [:], now: t0).agents.first?.isActive,
            false, "a process with no elapsed time yet is not classified")
 
-    // A window that cannot be trusted falls back to the lifetime average rather than
-    // producing a number from a division by almost nothing.
+    // A window that cannot be trusted is discarded, and discarded has to mean nothing is
+    // concluded - not "substitute the lifetime average", which is a different measurement
+    // over a different span. The spike below would otherwise read as 50 cores.
     let spike = burning(1, from: idleSeed, fraction: 50, dt: 0.01)
     for (dt, what) in [(0.0, "dt of zero"), (-5.0, "negative dt"),
                        (0.01, "dt below the floor"), (86_400.0, "dt across a machine sleep")] {
@@ -277,6 +278,25 @@ suite("AgentsMonitor.classify") {
                                          activeSince: [:], now: t0)
         expect(out.agents.first?.isActive, false, "\(what) is discarded, not turned into a percentage")
     }
+    // The pair that tells "discarded" apart from "fall back to the lifetime average" - the
+    // one above passes either way, because its seed happens to average ~0. This is the case
+    // a laptop waking from sleep walks into every time: a session that worked hard this
+    // morning and has burned nothing since. Its lifetime average is half a core; the two
+    // samples say it used no CPU whatsoever.
+    let workedThisMorning = at(1, cpu: 1800 * oneCore, elapsed: 3600)
+    let stillParked = at(1, cpu: 1800 * oneCore, elapsed: 3600 + 7200)
+    let woke = AgentsMonitor.classify(previous: [workedThisMorning], current: [stillParked],
+                                      dt: 7200, activeSince: [:], now: t0)
+    expect(woke.agents.first?.isActive, false, "an untrusted window concludes nothing at all")
+    expect(woke.activeSince[1], nil, "and starts no grace period")
+    let measured = AgentsMonitor.classify(previous: [workedThisMorning], current: [stillParked],
+                                          dt: 10, activeSince: [:], now: t0)
+    expect(measured.agents.first?.isActive, false, "a window worth dividing by agrees")
+    // No baseline at all is a different case, and an untrusted `dt` must not take the
+    // lifetime average away from it: one sample supports nothing else.
+    expect(AgentsMonitor.classify(previous: [], current: [at(5, cpu: 1800 * oneCore)],
+                                  dt: 86_400, activeSince: [:], now: t0).agents.first?.isActive,
+           true, "a pid seen for the first time still gets its lifetime average")
 
     // Sessions come and go between scans, and the lists are sorted independently, so
     // nothing may be matched up by position.
@@ -724,6 +744,26 @@ suite("UsageModel.throttleDelay") {
     expect(UsageModel.throttleDelay(consecutive429: 1, advertised: -100), 60, "negative advertised")
     // And a bogus one cannot park the app for a day.
     expect(UsageModel.throttleDelay(consecutive429: 1, advertised: 86_400), 900, "absurd advertised")
+
+    // A non-finite advertised value is thrown away rather than clamped, because clamping
+    // does not work on one: NaN has no ordering, so `min`/`max` pass it straight through.
+    // What comes out the far end is a NaN `throttledUntil`, a date every comparison in the
+    // app is false against - no countdown, refresh button live, and the poll loop back to
+    // its 25s floor inside the window it is meant to be waiting out.
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: .nan), 60, "NaN advertised")
+    expect(UsageModel.throttleDelay(consecutive429: 3, advertised: .nan), 240,
+           "NaN does not disturb the doubling")
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: .infinity), 60, "infinite")
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: -.infinity), 60, "negative infinite")
+
+    // End to end from the header, since `Double` parses all three of these happily.
+    let then = Date(timeIntervalSince1970: 1_785_412_800)
+    for header in ["nan", "NaN", "inf", "-inf", "infinity"] {
+        let delay = UsageModel.throttleDelay(
+            consecutive429: 1, advertised: UsageModel.retryAfterSeconds(header, now: then))
+        expectTrue(delay.isFinite && delay >= UsageModel.minThrottle,
+                   "Retry-After: \(header) still yields a usable backoff")
+    }
 }
 
 suite("UsageModel.pollDelay") {

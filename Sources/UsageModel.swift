@@ -61,16 +61,17 @@ final class UsageModel: ObservableObject {
             }
             clock.tick()
             startClock()
-            // The scan is skipped while nothing displays it (see `start`), so the list
-            // could be minutes old by the time the panel opens.
-            scanAgentsNow()
+            // The scan is skipped, and the loop behind it stopped, while nothing displays
+            // the result (see `startAgentScan`), so the list could be minutes old - or
+            // absent - by the time the panel opens.
+            wakeAgentScan()
         }
     }
 
     @Published var showAgents: Bool {
         didSet {
             UserDefaults.standard.set(showAgents, forKey: Keys.showAgents)
-            if showAgents, !oldValue { scanAgentsNow() }
+            if showAgents, !oldValue { wakeAgentScan() }
         }
     }
 
@@ -132,7 +133,7 @@ final class UsageModel: ObservableObject {
     /// a 750-process table the slow one spends about 0.4 s of CPU per hour and the fast one
     /// about a millisecond per tick. They are deliberately unhurried anyway - a count in
     /// the menu bar being half a minute stale is invisible, and the panel already scans the
-    /// moment it opens (`scanAgentsNow`), so the interval below only governs how a session
+    /// moment it opens (`wakeAgentScan`), so the interval below only governs how a session
     /// that ends *while you are looking* disappears.
     static let agentScanInterval: TimeInterval = 30
     static let agentScanIntervalPanelOpen: TimeInterval = 10
@@ -183,10 +184,19 @@ final class UsageModel: ObservableObject {
     /// only ever a floor: honoring `Retry-After: 0` literally would retry straight back
     /// into the same window. The exponent is capped at 8 so a long outage cannot overflow
     /// it; `maxThrottle` has already flattened the result well before that.
+    ///
+    /// **A non-finite `advertised` is thrown away rather than clamped**, because clamping
+    /// does not work on one: NaN has no ordering, so `min`/`max` carry it straight through
+    /// - the same trap `Fmt.clampPercent` exists for, and `Double("nan")` parses. A NaN
+    /// reaching here becomes a NaN `throttledUntil`, and every comparison against *that*
+    /// date is false: no countdown in the footer, the refresh button live, and the poll
+    /// loop back to its 25s floor inside the very window it is supposed to be backing off
+    /// from. A header that is not a number is no advice, which is what `0` already means.
     nonisolated static func throttleDelay(consecutive429: Int,
                                           advertised: TimeInterval) -> TimeInterval {
         let n = min(max(consecutive429, 1), 8)
         let floor = minThrottle * pow(2, Double(n - 1))
+        let advertised = advertised.isFinite ? advertised : 0
         return min(max(advertised, floor), maxThrottle)
     }
 
@@ -237,28 +247,48 @@ final class UsageModel: ObservableObject {
 
     func start() {
         restartTimer()
-        // The agent list gets its own loop rather than riding on the clock or the poll.
-        // Both of those are paced by something unrelated - one by what the countdowns
-        // need, the other by an endpoint that rate limits - and a session that ends has
-        // to leave the panel and the menu bar promptly either way.
+        startAgentScan()
+        // No clock here: it starts with the panel. See `startClock`.
+    }
+
+    /// The process-scan loop, which gets its own cadence rather than riding on the clock or
+    /// the poll. Both of those are paced by something unrelated - one by what the
+    /// countdowns need, the other by an endpoint that rate limits - and a session that ends
+    /// has to leave the panel and the menu bar promptly either way.
+    ///
+    /// **It ends rather than idles when nothing is displaying a count.** Same reasoning as
+    /// `startClock`: with the panel shut and "Show agent count" off, every wakeup tested
+    /// two booleans and went back to sleep, which is a timer keeping a laptop out of its
+    /// deep idle states in exchange for nothing. Both switches call `wakeAgentScan`, so the
+    /// loop comes back the moment either one does, and `agentTask` is cleared on the way
+    /// out so that call can tell a dead loop from a running one.
+    private func startAgentScan() {
+        guard agentTask == nil, panelVisible || showAgents else { return }
         agentTask = Task { [weak self] in
+            defer { self?.agentTask = nil }
             while !Task.isCancelled {
-                // Without this the loop would keep spinning after the model is gone:
-                // nothing else cancels it.
-                guard let self else { return }
-                // Only scan while something is actually showing the result: the panel is
-                // open, or the menu bar carries the agents chip. Otherwise this is a walk
-                // of the whole process table feeding a list nobody can see. Publishing the
-                // result would also rebuild an open gear menu, hence `menuTracking`.
-                if !self.menuTracking, self.panelVisible || self.showAgents {
-                    await self.scanAndApply()
-                }
+                // Also stops the loop if the model went away underneath it, which nothing
+                // else would do.
+                guard let self, self.panelVisible || self.showAgents else { return }
+                // Publishing a result rebuilds an open gear menu under the pointer, hence
+                // `menuTracking`. Parked, not stopped: the menu closes in seconds.
+                if !self.menuTracking { await self.scanAndApply() }
                 try? await Task.sleep(for: .seconds(self.panelVisible
                                                     ? Self.agentScanIntervalPanelOpen
                                                     : Self.agentScanInterval))
             }
         }
-        // No clock here: it starts with the panel. See `startClock`.
+    }
+
+    /// Something that displays the count just turned on: get a fresh list on screen without
+    /// waiting for the loop's next tick, and start that loop if it had shut itself down.
+    ///
+    /// The two branches are exclusive on purpose. `startAgentScan` scans as its first act,
+    /// so calling both would walk the process table twice in the same millisecond - and two
+    /// scans that close together are exactly the window `AgentsMonitor.classify` has to
+    /// throw away.
+    private func wakeAgentScan() {
+        if agentTask == nil { startAgentScan() } else { scanAgentsNow() }
     }
 
     /// The 1 Hz clock, tied to `panelVisible` rather than started once and left running.
@@ -416,11 +446,17 @@ final class UsageModel: ObservableObject {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             switch code {
             case 200:
+                // Before the decode, not after it: what these two react to is the status
+                // line, and a 200 says the login works and the endpoint has stopped
+                // refusing us whether or not the body turns out to be readable. Set
+                // afterwards they were skipped by a `throw` from the decoder, which left
+                // the app on an 8 minute backoff and showing "Session expired" while the
+                // endpoint was answering it perfectly well.
+                authExpired = false
+                clearThrottle()
                 usage = try JSONDecoder().decode(UsageResponse.self, from: data)
                 lastUpdated = Date()
                 errorText = nil
-                authExpired = false
-                clearThrottle()
                 UserDefaults.standard.set(data, forKey: Keys.cachedUsage)
                 UserDefaults.standard.set(lastUpdated, forKey: Keys.cachedAt)
             case 401, 403:
@@ -481,11 +517,16 @@ final class UsageModel: ObservableObject {
     /// The chip list, as a function of the six things that decide it and nothing else.
     /// `nonisolated` and taking counts rather than the agents themselves so the rules
     /// above can be tested without a model, a fetch or the main actor.
+    ///
+    /// `activeAgentCount` deliberately has **no default**. It used to default to `0`, which
+    /// is not a neutral value here: it is the one that makes the chip read "0/7", so a
+    /// caller that simply forgot the argument would report every session idle rather than
+    /// fail to compile.
     nonisolated static func segments(usage: UsageResponse?,
                                      titleMode: TitleMode,
                                      errorText: String?,
                                      agentCount: Int,
-                                     activeAgentCount: Int = 0,
+                                     activeAgentCount: Int,
                                      showAgents: Bool) -> [StatusIcon.Segment] {
         var out: [StatusIcon.Segment] = []
 
