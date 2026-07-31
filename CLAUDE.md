@@ -32,7 +32,7 @@ would not move (writes land in `Contents/`) and every `make` would rebuild. `Res
 is a prerequisite too, otherwise swapping the menu bar mark never triggers a rebuild.
 
 `make test` is the one exception: it compiles **every source but `App.swift`** with
-`Tests/main.swift` into a command line binary and runs it (255 checks, about a second).
+`Tests/main.swift` into a command line binary and runs it (268 checks, about a second).
 `App.swift` is left out because its `@main` cannot coexist with top-level code, and what
 it holds is `NSStatusItem`/`NSPopover` wiring that means nothing without a running app.
 There is no XCTest: the harness is twenty lines at the top of `Tests/main.swift`, and because
@@ -40,8 +40,9 @@ it is top-level code the file has to be called `main.swift` and cannot be compil
 `-parse-as-library`.
 
 What is covered: the process-table rules (`isAgent`, `hostName`, `precedes`,
-`sameOnScreen`, `humanElapsed`), severity, `Fmt`, the derived rows and gauges, **how the
-decoder degrades** when the response changes shape, the menu bar chips
+`sameOnScreen`, `humanElapsed`), the activity classifier (`classify`, including what a
+window it cannot trust may and may not conclude), severity, `Fmt`, the derived rows and
+gauges, **how the decoder degrades** when the response changes shape, the menu bar chips
 (`UsageModel.segments`), the whole 429 policy (`retryAfterSeconds`, `throttleDelay`,
 `pollDelay`, `fetchAllowedAt`), `StatusIcon.statusImage`'s template rule and accessibility
 description, `Credentials.parse` and `LoginItem.isInstalled`.
@@ -127,19 +128,26 @@ so nobody reads them as a state the app can be in.
   (in memory), never `lastUpdated`, which is restored from the on-disk cache and would
   make a relaunch skip its first fetch. `panelVisible` gates the 1 Hz clock, which only
   exists for the countdowns inside the panel, and together with `showAgents` it also
-  gates the process scan: neither runs while nothing displays the result. Both flip on
-  through `scanAgentsNow()`, so the list is fresh the instant the panel opens.
+  gates the process scan: neither runs while nothing displays the result.
   - **Three loops, three unrelated cadences.** The poll (`pollTask`) is paced by an
     endpoint that rate limits; the clock (`tickTask`) by what the countdowns need; the
     agent scan (`agentTask`) by nothing at all, since it is a local `libproc` walk.
     Folding the scan into the tick loop, as it once was, is what let a 15 minute usage
     interval and a finished session end up on the same schedule in people's heads.
+  - **Two of the three loops end rather than idle**, and for the same reason: a timer that
+    wakes to test a boolean and go back to sleep buys nothing and keeps a laptop out of its
+    deep idle states. `startClock` runs only while `panelVisible` (86 400 wakeups a day
+    otherwise); `startAgentScan` only while `panelVisible || showAgents`, and it clears
+    `agentTask` on the way out so `wakeAgentScan` can tell a dead loop from a running one.
+    That distinction is load-bearing: `startAgentScan` scans as its first act, so a switch
+    flipping on has to *either* start the loop *or* call `scanAgentsNow()`, never both -
+    two scans a millisecond apart are exactly the window `classify` has to throw away.
   - **The two cadences are 10s (panel open) and 30s (chip only).** They used to be 1s and
     10s, back when the scan forked `ps` and cost ~33ms of CPU; through `libproc` the same
     work is **~3ms** on a 750-process table, so neither number is paying for anything any
     more and both were slowed down on purpose instead. A count in the menu bar being half
     a minute stale is invisible, and the panel scans the moment it opens
-    (`scanAgentsNow()`), so the open cadence only governs how a session that ends *while
+    (`wakeAgentScan()`), so the open cadence only governs how a session that ends *while
     you are watching* leaves the list.
   - `AgentsMonitor.scan()` returns an **optional**, and `applyScan` ignores `nil`. `nil`
     means the table could not be read, which says nothing about how many agents are
@@ -188,6 +196,18 @@ so nobody reads them as a state the app can be in.
     stopped refusing us, so the doubling has to start over; a 401 arriving after two 429s
     used to leave the counter at 2 and the next blip started at 4 minutes instead of one.
     A failed request proves nothing either way, so it leaves the backoff untouched.
+    In the 200 branch it runs **before** the decode, alongside `authExpired = false`: what
+    both react to is the status line, and a `throw` from the decoder used to skip them and
+    leave the app on an 8 minute backoff still showing "Session expired" while the endpoint
+    was answering it perfectly well.
+  - **`throttleDelay` throws away a non-finite `Retry-After` instead of clamping it**, and
+    the difference matters because clamping does not work on one. `Double("nan")` parses,
+    NaN has no ordering, so `min`/`max` carry it straight through - the same trap
+    `Fmt.clampPercent` exists for. What came out was a NaN `throttledUntil`, a date every
+    comparison in the app is false against: no countdown in the footer, the refresh button
+    live, and `pollDelay` back to its 25s floor *inside* the window it was meant to be
+    waiting out, which is the one behaviour known to hold that window open. A header that
+    is not a number is no advice, which is what `0` already means.
   - **The gear menu is unusable if the panel redraws while it is open.** A SwiftUI `Menu`
     is an `NSMenu`; re-running `UsageView.body` rebuilds its items under the pointer, so
     the "Refresh every" submenu flickered open and shut and swallowed the click. Two
@@ -207,7 +227,10 @@ so nobody reads them as a state the app can be in.
     themselves are
     `static segments(usage:titleMode:errorText:agentCount:activeAgentCount:showAgents:)`
     and the instance method just feeds it the model's state, so every mode, the `!` chip
-    and the agents chip are covered by tests. The agents chip reads `agentsChipText`:
+    and the agents chip are covered by tests. `activeAgentCount` has **no default value**,
+    deliberately: `0` is not neutral here, it is the value that makes the chip read "0/7",
+    so a caller that forgets the argument has to fail to compile rather than report every
+    session idle. The agents chip reads `agentsChipText`:
     "1/7" when some sessions are working and others are only open, and a bare count when
     the fraction would say nothing ("7/7" and "1/1" spend menu bar width on a tautology). The red `!` is the one chip that ignores
     `titleMode`, "Icon only" included: a warning that the numbers stopped being true has
@@ -308,6 +331,24 @@ so nobody reads them as a state the app can be in.
       (`cpuNanos / elapsed`). That reads low for a session idle for hours that just started
       working, and it corrects itself on the next scan; the alternative is showing zero
       active sessions for the first ten seconds after launch.
+    - **"No baseline" and "an untrusted window" are different cases and `load` keeps them
+      apart** (hence `windowUsable` as its own parameter rather than a `nil` `dt`). Only the
+      first one gets the lifetime average. Folding them together meant *discarding* a window
+      silently substituted a measurement of a different span: a session that worked hard
+      this morning and has been parked at the prompt since carries a lifetime average well
+      over the threshold, so every wake from sleep - `dt` of hours, discarded - lit up every
+      such session for a full 45s grace period while they burned nothing at all. Measured on
+      a live table, 3 of 15 sessions were above 2% on lifetime average alone. An untrusted
+      window now concludes nothing and lets the hysteresis hold the last real verdict.
+      The test for this needs a fixture with a *busy* lifetime average: the obvious one
+      (an idle seed plus an impossible spike) passes either way.
+      **Waking from sleep is not the only way in, and the everyday one costs a scan.**
+      `previousScanAt` is not cleared when the scan loop stops, so reopening the panel with
+      the agents chip off arrives with a `dt` of minutes: untrusted, nothing concluded, and
+      every session already running reads idle until the next scan 10s later. That is a
+      restart being a first scan that does not get the first-scan fallback, and it is the
+      trade taken on purpose - ten seconds of under-reporting beats lighting up 3 of 15
+      sessions that are doing nothing. Clearing the baseline on the way out would undo it.
     - Rejected, with reasons, so they do not come back: **memory as the activity signal**
       (measured across 12 sessions, RSS does not fall when a session goes idle - 104 MB on
       a 3.5 hour session against 342 MB on a five minute one, and two freshly opened
@@ -449,7 +490,8 @@ the response: the client-side backoff is the whole strategy. Worse, the value it
 `Retry-After: 0` while it is *still* refusing requests - measured with a token from the
 keychain, 12 of 12 probes 30s apart over 5.5 minutes returned `429` and every one of them
 carried `Retry-After: 0`. So do **not** honor `Retry-After` literally: it is treated as a
-lower bound only.
+lower bound only, and a non-finite one is thrown away outright (see `throttleDelay` above -
+`Double("nan")` parses, and NaN survives every clamp it is passed through).
 
 The real backoff is `consecutive429`, doubling from `minThrottle` (60s -> 2m -> 4m -> 8m)
 and clamped by `maxThrottle` (900s), reset by any 200. A single blip therefore recovers on
