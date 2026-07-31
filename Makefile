@@ -29,11 +29,15 @@ $(APP): $(SOURCES) $(RESOURCES) build.sh
 test: $(TESTS)
 	@$(TESTS)
 
-# Only the two files that hold pure logic; the rest needs a running app to mean anything.
-$(TESTS): Sources/Models.swift Sources/AgentsMonitor.swift Tests/main.swift
+# Everything except App.swift: its `@main` cannot coexist with the top-level code in
+# Tests/main.swift, and what it holds is NSStatusItem/NSPopover wiring that means nothing
+# without a running app anyway.
+TEST_SOURCES := $(filter-out Sources/App.swift,$(SOURCES))
+
+$(TESTS): $(TEST_SOURCES) Tests/main.swift
 	@mkdir -p $(BUILD_DIR)
-	swiftc -o $(TESTS) Sources/Models.swift Sources/AgentsMonitor.swift Tests/main.swift \
-		-framework AppKit -framework SwiftUI
+	swiftc -o $(TESTS) $(TEST_SOURCES) Tests/main.swift \
+		-framework AppKit -framework SwiftUI -framework ServiceManagement
 
 ## install: build, copy to ~/Applications and launch
 install:

@@ -52,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .applicationDefined
         popover.animates = false
         popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: UsageView(model: model))
+        // The panel itself is built on first use and released on close: see `panelView`.
 
         // Redraw the status title whenever the data changes. `objectWillChange` fires
         // before the value lands, so delivery on the next run loop pass is what makes
@@ -64,8 +64,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.updateTitle() }
             .store(in: &cancellables)
 
-        // Second line of defence for the gear menu. The clock lives on its own object so a
-        // tick can no longer reach `UsageView.body`, but the agent scan and the poll still
+        // Second line of defence for the gear menu. The clock lives on its own object, so
+        // a tick cannot reach `UsageView.body` at all, but the agent scan and the poll do
         // publish through the model, and either one landing while the menu is tracking
         // rebuilds its items under the pointer. Both park while this is set.
         //
@@ -121,10 +121,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Builds the SwiftUI panel, which exists only while it is on screen.
+    ///
+    /// **Do not hoist this into a stored property.** A hosting controller is not an idle
+    /// object: its view graph stays subscribed to the model, so every agent scan publishes
+    /// into a view nobody can see and SwiftUI answers with a layout pass (visible in a
+    /// `sample` of the app with the popover closed). It also holds a window's worth of
+    /// backing store - IOSurface, CoreAnimation and IOAccelerator came to ~7 MB together -
+    /// for a panel that is shut ~99% of the time.
+    ///
+    /// Rebuilding it per open is safe because the panel keeps no state of its own: every
+    /// value it draws lives in `UsageModel`, which outlives it.
+    private func panelView() -> NSViewController {
+        NSHostingController(rootView: UsageView(model: model))
+    }
+
     private func showPopover() {
         guard let button = statusItem.button else { return }
         Task { await model.refresh() }   // no-ops if the numbers are still fresh
         model.panelVisible = true
+        if popover.contentViewController == nil { popover.contentViewController = panelView() }
         // Accessory apps must activate, otherwise the popover cannot take key focus.
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -149,10 +165,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         dismissMonitors = [outside, escape].compactMap { $0 }
 
-        // A mouse monitor cannot see Cmd+Tab, so switching apps by keyboard used to leave
-        // the panel floating over whatever came forward. An NSMenu does not deactivate the
-        // app, so the gear menu is safe from this; opening the usage page in a browser
-        // does deactivate, and closing the panel then is the wanted behaviour anyway.
+        // A mouse monitor cannot see Cmd+Tab, which would otherwise leave the panel
+        // floating over whatever came forward. An NSMenu does not deactivate the app, so
+        // the gear menu is safe from this; opening the usage page in a browser does
+        // deactivate, and closing the panel then is the wanted behaviour anyway.
         dismissObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -171,6 +187,15 @@ extension AppDelegate: NSPopoverDelegate {
         if let dismissObserver {
             NotificationCenter.default.removeObserver(dismissObserver)
             self.dismissObserver = nil
+        }
+        // Let the popover finish tearing its window down before the content goes: this is
+        // called from inside that teardown, and releasing the view controller under it is
+        // asking for trouble. Next run loop pass is soon enough - `showPopover` rebuilds
+        // it, so the only thing that could race is a reopen, which cannot happen before
+        // this block runs.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.popover.isShown else { return }
+            self.popover.contentViewController = nil
         }
     }
 }

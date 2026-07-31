@@ -1,9 +1,19 @@
+import AppKit
 import Foundation
 
-// Tests for the pure logic: process-table parsing, severity, formatting and the derived
-// rows. No XCTest and no test target, for the same reason there is no Xcode project: a
-// plain `swiftc` invocation over the two files that hold logic keeps this a one-second
-// run. `make test` builds and runs it. Everything here must stay free of AppKit state.
+// Tests for everything that can be decided without a running app: the process-table
+// rules, severity, formatting, the derived rows, the menu bar chips, the 429 backoff
+// arithmetic, the status image, the credentials parser and the login-item rule. No XCTest
+// and no test target, for the same reason there is no Xcode project: one `swiftc`
+// invocation over every source but `App.swift` keeps this a one-second run. `make test`
+// builds and runs it.
+//
+// The line between what is tested here and what is not is the main actor and the outside
+// world. Anything needing an `NSStatusItem`, a socket or the real process table stays
+// out, which is why the decisions inside `UsageModel` are reached through `nonisolated
+// static` functions that take their inputs rather than read them off a published model.
+// AppKit is imported but never started: `StatusIcon` only measures and draws into an
+// `NSImage`, which needs no `NSApplication`.
 
 var failures = 0
 var checks = 0
@@ -16,6 +26,10 @@ func expect<T: Equatable>(_ actual: T, _ expected: T, _ what: String, line: UInt
     }
 }
 
+func expectTrue(_ actual: Bool, _ what: String, line: UInt = #line) {
+    expect(actual, true, what, line: line)
+}
+
 func suite(_ name: String, _ body: () -> Void) {
     print("• \(name)")
     body()
@@ -23,83 +37,102 @@ func suite(_ name: String, _ body: () -> Void) {
 
 // MARK: - Process table
 
-suite("AgentsMonitor.isClaude") {
+suite("AgentsMonitor.isAgent") {
+    // `execPath` is what the kernel ran, already symlink-resolved; argv is the vector as
+    // it was stored at exec. Both come straight from libproc, so neither is reconstructed
+    // from text and neither can be ambiguous.
+    func agent(_ exec: String, _ argv: [String] = []) -> Bool {
+        AgentsMonitor.isAgent(execPath: exec, argv: argv.isEmpty ? [exec] : argv)
+    }
     // The IDE extension ships its own binary.
-    expect(AgentsMonitor.isClaude(args:
-        "/Users/x/.vscode/extensions/anthropic.claude-code-2.1.220-darwin-arm64/resources/native-binary/claude --output-format stream-json"),
-        true, "vscode native binary")
-    // Native install, run through the symlink and through the resolved version path.
-    expect(AgentsMonitor.isClaude(args: "/Users/x/.local/bin/claude"), true, "native symlink")
-    expect(AgentsMonitor.isClaude(args: "/Users/x/.local/share/claude/versions/2.0.76 --resume"),
-           true, "resolved version binary")
-    // npm/bun installs go through an interpreter.
-    expect(AgentsMonitor.isClaude(args: "node /opt/homebrew/bin/claude -p hello"), true, "node shim")
-    expect(AgentsMonitor.isClaude(args:
-        "/usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
-        true, "node entry point")
-    expect(AgentsMonitor.isClaude(args: "bun /Users/x/.bun/bin/claude"), true, "bun shim")
-    // Neither the desktop app nor this app is an agent.
-    expect(AgentsMonitor.isClaude(args: "/Applications/Claude.app/Contents/MacOS/Claude"),
-           false, "desktop app")
-    expect(AgentsMonitor.isClaude(args:
-        "/Users/x/Applications/ClaudeUsage.app/Contents/MacOS/ClaudeUsage"), false, "this app")
-    // A file that happens to be called claude is not a session: only a known
-    // interpreter's argv[1] counts.
-    expect(AgentsMonitor.isClaude(args: "vim claude"), false, "editing a file named claude")
-    expect(AgentsMonitor.isClaude(args: "grep -r claude ."), false, "grep")
-    expect(AgentsMonitor.isClaude(args: ""), false, "empty args")
-    expect(AgentsMonitor.isClaude(args: "/usr/bin/vim notes.txt"), false, "no claude anywhere")
-
-    // `ps` prints argv space-joined and unquoted, so an install path with a space in it
-    // looks like two arguments. `exists` decides whether to fold the next token in.
-    let nothingExists: (String) -> Bool = { _ in false }
-    expect(AgentsMonitor.isClaude(args: "/Users/x/My Code/.local/bin/claude --resume",
-                                  exists: nothingExists),
-           true, "space in the install path")
-    expect(AgentsMonitor.isClaude(args: "node /Users/x/My Code/bin/claude", exists: nothingExists),
+    expect(agent("/Users/x/.vscode/extensions/anthropic.claude-code-2.1.220-darwin-arm64/resources/native-binary/claude"),
+           true, "vscode native binary")
+    // Native install: the symlink resolves to the versioned binary before we see it, so
+    // both spellings have to match.
+    expect(agent("/Users/x/.local/bin/claude"), true, "native install")
+    expect(agent("/Users/x/.local/share/claude/versions/2.0.76"), true, "resolved version binary")
+    // npm/bun installs go through an interpreter, and only there does argv count.
+    expect(agent("/opt/homebrew/bin/node", ["node", "/opt/homebrew/bin/claude", "-p", "hello"]),
+           true, "node shim")
+    expect(agent("/usr/local/bin/node",
+                 ["node", "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"]),
+           true, "node entry point")
+    expect(agent("/Users/x/.bun/bin/bun", ["bun", "/Users/x/.bun/bin/claude"]), true, "bun shim")
+    // Flags in front of the script must not hide it.
+    expect(agent("/usr/local/bin/node", ["node", "--enable-source-maps", "/opt/bin/claude"]),
+           true, "interpreter flags before the script")
+    // Nor may a flag that takes a *value*, which lands exactly where "the first argument
+    // without a dash" expects to find the script. These used to be missed outright.
+    expect(agent("/usr/local/bin/node", ["node", "-r", "./polyfill.js", "/opt/bin/claude"]),
+           true, "value-taking flag before the script")
+    expect(agent("/usr/local/bin/node",
+                 ["node", "--import", "./hook.mjs", "--enable-source-maps", "/opt/bin/claude"]),
+           true, "several flags, one of them with a value")
+    expect(agent("/usr/local/bin/node", ["node", "-r", "./polyfill.js", "/opt/tools/lint"]),
+           false, "value-taking flag and no claude anywhere")
+    // Neither the desktop app nor this app is an agent (`Claude` is not `claude`).
+    expect(agent("/Applications/Claude.app/Contents/MacOS/Claude"), false, "desktop app")
+    expect(agent("/Users/x/Applications/ClaudeUsage.app/Contents/MacOS/ClaudeUsage"),
+           false, "this app")
+    // A file that happens to be called claude is not a session: the executable decides,
+    // and only a known interpreter's script argument gets a second look.
+    expect(agent("/usr/bin/vim", ["vim", "claude"]), false, "editing a file named claude")
+    expect(agent("/usr/bin/grep", ["grep", "-r", "claude", "."]), false, "grep")
+    expect(agent("", []), false, "no executable")
+    expect(agent("/usr/bin/vim", ["vim", "notes.txt"]), false, "no claude anywhere")
+    // An interpreter with nothing to run, and one running something else.
+    expect(agent("/usr/local/bin/node", ["node"]), false, "bare interpreter")
+    expect(agent("/usr/local/bin/node", ["node", "--eval", "--"]), false, "interpreter, flags only")
+    expect(agent("/usr/local/bin/node", ["node", "/opt/tools/lint", "claude-code"]),
+           false, "interpreter running something else")
+    // `cli.js` only counts inside the package: it is the most generic name in npm.
+    expect(agent("/usr/local/bin/node", ["node", "/opt/other/cli.js"]), false, "unrelated cli.js")
+    // A path with a space in it is just a path: the executable arrives as its own string,
+    // so there is no joined line to split and no quoting to recover.
+    expect(agent("/Users/x/My Code/.local/bin/claude"), true, "space in the install path")
+    expect(agent("/usr/local/bin/node", ["node", "/Users/x/My Code/bin/claude"]),
            true, "space in the path behind an interpreter")
-    // But folding must not invent a match: a real executable is never extended, and a
-    // relative argv[0] is never extended at all.
-    expect(AgentsMonitor.isClaude(args: "/usr/bin/vim claude", exists: { $0 == "/usr/bin/vim" }),
-           false, "editing claude through an absolute path")
-    expect(AgentsMonitor.isClaude(args: "/opt/tools/lint claude-code", exists: nothingExists),
-           false, "folded candidate that still is not claude")
-}
-
-suite("AgentsMonitor.argv0Candidates") {
-    let nothingExists: (String) -> Bool = { _ in false }
-    expect(AgentsMonitor.argv0Candidates("vim claude", exists: nothingExists),
-           ["vim"], "relative argv0 is never extended")
-    expect(AgentsMonitor.argv0Candidates("/a/b c/d --flag e", exists: nothingExists),
-           ["/a/b", "/a/b c/d"], "folds until a flag")
-    expect(AgentsMonitor.argv0Candidates("/bin/ls extra", exists: { $0 == "/bin/ls" }),
-           ["/bin/ls"], "stops once the candidate exists")
-    expect(AgentsMonitor.argv0Candidates("", exists: nothingExists), [], "empty")
+    // A shell wrapper named `claude` arrives as the shell, with argv[0] naming the shell
+    // too (verified against a live `#!/bin/sh` script), so it does not match.
+    expect(agent("/bin/bash", ["/bin/sh", "./claude"]), false, "shell wrapper named claude")
 }
 
 suite("AgentsMonitor.hostName") {
-    expect(AgentsMonitor.hostName(args: "/Users/x/.vscode/extensions/anthropic.claude-code/claude"),
-           "VS Code", "vscode")
-    expect(AgentsMonitor.hostName(args: "/Users/x/.cursor/extensions/anthropic.claude-code/claude"),
-           "Cursor", "cursor")
-    expect(AgentsMonitor.hostName(args: "/Users/x/.local/bin/claude -p 'do a thing'"),
-           "Headless", "-p")
-    expect(AgentsMonitor.hostName(args: "/Users/x/.local/bin/claude --print"), "Headless", "--print")
-    expect(AgentsMonitor.hostName(args: "/Users/x/.local/bin/claude"), "Terminal", "plain")
+    func host(_ exec: String, _ argv: [String] = []) -> String {
+        AgentsMonitor.hostName(execPath: exec, argv: argv.isEmpty ? [exec] : argv)
+    }
+    let cli = "/Users/x/.local/bin/claude"
+    expect(host("/Users/x/.vscode/extensions/anthropic.claude-code/claude"), "VS Code", "vscode")
+    expect(host("/Users/x/.vscode-server/bin/claude"), "VS Code", "vscode remote")
+    expect(host("/Users/x/.cursor/extensions/anthropic.claude-code/claude"), "Cursor", "cursor")
+    expect(host("/Users/x/Library/Application Support/JetBrains/plugin/claude"),
+           "JetBrains", "jetbrains")
+    expect(host(cli, [cli, "--ide", "/Users/x/project/.idea"]), "JetBrains", "idea from argv")
+    expect(host(cli, [cli, "-p", "do a thing"]), "Headless", "-p")
+    expect(host(cli, [cli, "--print"]), "Headless", "--print")
+    expect(host(cli), "Terminal", "plain")
     // A path containing "-p" is not a headless run.
-    expect(AgentsMonitor.hostName(args: "/Users/x/my-project/bin/claude"), "Terminal", "-p in a path")
-    expect(AgentsMonitor.hostName(args: "/Users/x/bin/my-print/claude"), "Terminal", "--print in a path")
+    expect(host("/Users/x/my-project/bin/claude"), "Terminal", "-p in a path")
+    expect(host("/Users/x/bin/my-print/claude"), "Terminal", "--print in a path")
     // argv[0] itself is skipped, so an executable literally called -p is not a flag.
-    expect(AgentsMonitor.hostName(args: "-p"), "Terminal", "argv0 only")
-    expect(AgentsMonitor.hostName(args: "/Users/x/.local/bin/claude --resume -p"), "Headless", "trailing -p")
-}
-
-suite("AgentsMonitor.elapsedSeconds") {
-    expect(AgentsMonitor.elapsedSeconds("03:12"), 192, "mm:ss")
-    expect(AgentsMonitor.elapsedSeconds("00:07"), 7, "seconds only")
-    expect(AgentsMonitor.elapsedSeconds("03:49:30"), 13_770, "hh:mm:ss")
-    expect(AgentsMonitor.elapsedSeconds("2-03:49:30"), 186_570, "dd-hh:mm:ss")
-    expect(AgentsMonitor.elapsedSeconds("garbage"), 0, "unparseable")
+    expect(host("-p"), "Terminal", "argv0 only")
+    expect(host(cli, [cli, "--resume", "-p"]), "Headless", "trailing -p")
+    // A prompt that merely contains " -p " is one argv entry, never a flag: the vector
+    // is matched entry by entry rather than flattened into a line.
+    expect(host(cli, [cli, "fix the -p flag"]), "Terminal", "-p inside a prompt")
+    // The IDE markers get the same treatment. A prompt is an argv entry like any other, so
+    // matching them against the flattened line made talking about VS Code a VS Code
+    // session; only entries that look like a path (a slash, no whitespace) are searched.
+    expect(host(cli, [cli, "-p", "fix the .vscode/extensions loader"]), "Headless",
+           "a prompt naming an extensions folder is not an IDE session")
+    expect(host(cli, [cli, "rename .idea/workspace.xml and move on"]), "Terminal",
+           "a prompt naming .idea is not JetBrains")
+    // But a real path argument still counts, spaces in the *executable* included: it is a
+    // path by definition, so it is searched whatever it contains.
+    expect(host(cli, [cli, "--add-dir", "/Users/x/.cursor/extensions/anthropic.claude-code"]),
+           "Cursor", "path argument still identifies the host")
+    expect(host("/Users/x/My Apps/JetBrains/plugin/claude"), "JetBrains",
+           "space in the executable path")
 }
 
 suite("AgentsMonitor.humanElapsed") {
@@ -148,7 +181,134 @@ suite("AgentsMonitor.sameOnScreen") {
     expect(AgentsMonitor.sameOnScreen(now, now + [agent(3, "app", 5)]), false, "one opened")
     expect(AgentsMonitor.sameOnScreen(now, [agent(1, "penmark", 600), agent(9, "nexus", 60)]),
            false, "same shape, different pid")
+    // The working directory can read empty on the scan that first sees a process and
+    // resolve on the next one, so it has to count as a change under a stable pid.
+    expect(AgentsMonitor.sameOnScreen(now, [agent(1, "", 600), agent(2, "nexus", 60)]),
+           false, "folder resolved late")
     expect(AgentsMonitor.sameOnScreen([], []), true, "both empty")
+
+    // The two new columns follow the same rule as `elapsed`/`uptime`: the raw number moves
+    // on every scan and must not publish, the string drawn from it must.
+    func sized(_ id: Int32, _ bytes: UInt64, active: Bool = false) -> AgentProcess {
+        AgentProcess(id: id, folder: "penmark", host: "Terminal", elapsed: 600,
+                     uptime: "10m", cpuNanos: 0, memoryBytes: bytes,
+                     memoryText: Fmt.memory(bytes, locale: Locale(identifier: "en_US")),
+                     isActive: active)
+    }
+    let mb200 = UInt64(200 * 1_048_576)
+    expect(AgentsMonitor.sameOnScreen([sized(1, mb200)], [sized(1, mb200 + 4096)]),
+           true, "memory moving a few pages does not move the string")
+    expect(AgentsMonitor.sameOnScreen([sized(1, mb200)], [sized(1, mb200 + 3_000_000)]),
+           false, "memory crossing a megabyte")
+    expect(AgentsMonitor.sameOnScreen([sized(1, mb200)], [sized(1, mb200, active: true)]),
+           false, "a session starting work")
+    // cpuNanos climbs on every single scan and is not drawn anywhere.
+    let a = AgentProcess(id: 1, folder: "p", host: "Terminal", elapsed: 600, uptime: "10m",
+                         cpuNanos: 1_000_000, memoryBytes: mb200, memoryText: "200 MB")
+    let b = AgentProcess(id: 1, folder: "p", host: "Terminal", elapsed: 601, uptime: "10m",
+                         cpuNanos: 9_999_999_999, memoryBytes: mb200, memoryText: "200 MB")
+    expect(AgentsMonitor.sameOnScreen([a], [b]), true, "cpu counter alone is not a change")
+}
+
+suite("AgentsMonitor.classify") {
+    let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+    let oneCore = 1_000_000_000.0    // nanoseconds of CPU per second of wall clock
+    /// A sample: pid, CPU burned since it started, how long it has been up.
+    func at(_ id: Int32, cpu: Double, elapsed: TimeInterval = 3600) -> AgentProcess {
+        AgentProcess(id: id, folder: "penmark", host: "Terminal", elapsed: elapsed,
+                     uptime: "1h 0m", cpuNanos: UInt64(cpu), memoryBytes: 0, memoryText: "0 MB")
+    }
+    /// Burn `fraction` of a core for `dt` seconds on top of `from`.
+    func burning(_ id: Int32, from: AgentProcess, fraction: Double, dt: TimeInterval) -> AgentProcess {
+        at(id, cpu: Double(from.cpuNanos) + fraction * oneCore * dt, elapsed: from.elapsed + dt)
+    }
+    let idleSeed = at(1, cpu: 0)      // lifetime average 0, so the seed says idle
+
+    // The threshold itself: below, above, and exactly on it.
+    for (fraction, expected, what) in [(0.005, false, "well under the threshold"),
+                                       (AgentsMonitor.activeThreshold - 0.001, false, "just under"),
+                                       (AgentsMonitor.activeThreshold, true, "exactly on it"),
+                                       (0.40, true, "clearly working")] {
+        let next = burning(1, from: idleSeed, fraction: fraction, dt: 10)
+        let out = AgentsMonitor.classify(previous: [idleSeed], current: [next], dt: 10,
+                                         activeSince: [:], now: t0)
+        expect(out.agents.first?.isActive, expected, what)
+    }
+
+    // Hysteresis: bursty token streaming, and a session waiting on a long `bash`, must not
+    // flicker between "working" and "idle" every time a scan lands in a quiet moment.
+    let burst = burning(1, from: idleSeed, fraction: 0.5, dt: 10)
+    let marked = AgentsMonitor.classify(previous: [idleSeed], current: [burst], dt: 10,
+                                        activeSince: [:], now: t0)
+    expect(marked.agents.first?.isActive, true, "burst marks it active")
+    expect(marked.activeSince[1], t0, "and records when")
+    // Now nothing at all for a while.
+    let quiet = burning(1, from: burst, fraction: 0, dt: 10)
+    let inGrace = AgentsMonitor.classify(previous: [burst], current: [quiet], dt: 10,
+                                         activeSince: marked.activeSince,
+                                         now: t0.addingTimeInterval(AgentsMonitor.activeGrace - 1))
+    expect(inGrace.agents.first?.isActive, true, "still active inside the grace period")
+    let afterGrace = AgentsMonitor.classify(previous: [burst], current: [quiet], dt: 10,
+                                            activeSince: marked.activeSince,
+                                            now: t0.addingTimeInterval(AgentsMonitor.activeGrace + 1))
+    expect(afterGrace.agents.first?.isActive, false, "idle once the grace period is spent")
+
+    // First scan of all: no previous sample, so the verdict comes from the lifetime
+    // average rather than from nothing. A session that has burned 30 minutes of CPU in the
+    // hour it has been up is working; one that has burned a second is not.
+    let busyLife = at(2, cpu: 1800 * oneCore, elapsed: 3600)
+    let idleLife = at(3, cpu: 1 * oneCore, elapsed: 3600)
+    let first = AgentsMonitor.classify(previous: [], current: [busyLife, idleLife], dt: nil,
+                                       activeSince: [:], now: t0)
+    expect(first.agents.first(where: { $0.id == 2 })?.isActive, true, "first scan, busy lifetime")
+    expect(first.agents.first(where: { $0.id == 3 })?.isActive, false, "first scan, idle lifetime")
+    // A process too young to divide by.
+    let newborn = at(4, cpu: 5 * oneCore, elapsed: 0)
+    expect(AgentsMonitor.classify(previous: [], current: [newborn], dt: nil,
+                                  activeSince: [:], now: t0).agents.first?.isActive,
+           false, "a process with no elapsed time yet is not classified")
+
+    // A window that cannot be trusted falls back to the lifetime average rather than
+    // producing a number from a division by almost nothing.
+    let spike = burning(1, from: idleSeed, fraction: 50, dt: 0.01)
+    for (dt, what) in [(0.0, "dt of zero"), (-5.0, "negative dt"),
+                       (0.01, "dt below the floor"), (86_400.0, "dt across a machine sleep")] {
+        let out = AgentsMonitor.classify(previous: [idleSeed], current: [spike], dt: dt,
+                                         activeSince: [:], now: t0)
+        expect(out.agents.first?.isActive, false, "\(what) is discarded, not turned into a percentage")
+    }
+
+    // Sessions come and go between scans, and the lists are sorted independently, so
+    // nothing may be matched up by position.
+    let p1 = at(1, cpu: 0), p2 = at(2, cpu: 0), p3 = at(3, cpu: 0)
+    let after = [burning(3, from: p3, fraction: 0.5, dt: 10), at(9, cpu: 0)]
+    let shuffled = AgentsMonitor.classify(previous: [p1, p2, p3], current: after, dt: 10,
+                                          activeSince: [:], now: t0)
+    expect(shuffled.agents.first(where: { $0.id == 3 })?.isActive, true, "matched by pid, not index")
+    expect(shuffled.agents.first(where: { $0.id == 9 })?.isActive, false, "a pid seen for the first time")
+    // A dead pid must not keep its verdict warm for whoever inherits the number.
+    expect(shuffled.activeSince[1], nil, "hysteresis entry dropped with the process")
+    let reused = AgentsMonitor.classify(previous: [burst], current: [at(1, cpu: 0, elapsed: 2)],
+                                        dt: 10, activeSince: [:], now: t0)
+    expect(reused.agents.first?.isActive, false, "a counter that went backwards is a new process")
+
+    expect(AgentsMonitor.classify(previous: [], current: [], dt: 10,
+                                  activeSince: [:], now: t0).agents.count, 0, "empty scan")
+}
+
+suite("AgentsMonitor.totalMemory") {
+    func held(_ id: Int32, _ bytes: UInt64) -> AgentProcess {
+        AgentProcess(id: id, folder: "p", host: "Terminal", elapsed: 60, uptime: "1m",
+                     memoryBytes: bytes, memoryText: Fmt.memory(bytes))
+    }
+    expect(AgentsMonitor.totalMemory([]), 0, "no sessions")
+    expect(AgentsMonitor.totalMemory([held(1, 100), held(2, 250)]), 350, "summed")
+    // Twelve sessions of a few hundred megabytes each is the real case, and it has to stay
+    // exact rather than overflow or round on the way to the footer.
+    let real = (1...12).map { held(Int32($0), 220 * 1_048_576) }
+    expect(AgentsMonitor.totalMemory(real), 12 * 220 * 1_048_576, "twelve live sessions")
+    expect(Fmt.memory(AgentsMonitor.totalMemory(real), locale: Locale(identifier: "en_US")),
+           "2.6 GB", "and formatted for the footer")
 }
 
 // MARK: - Severity
@@ -172,6 +332,18 @@ suite("Fmt") {
     expect(Fmt.percent(0), "0%", "zero")
     expect(Fmt.percent(72.4), "72%", "rounds down")
     expect(Fmt.percent(72.6), "73%", "rounds up")
+    // `Int(_: Double)` traps rather than saturating, and this number comes off an
+    // undocumented endpoint: `1e30` is valid JSON, decodes into an ordinary `Double` and
+    // used to kill the app on the next menu bar redraw. None of these may crash.
+    expect(Fmt.percent(.nan), "0%", "NaN")
+    expect(Fmt.percent(.infinity), "9999%", "infinity")
+    expect(Fmt.percent(-.infinity), "0%", "negative infinity")
+    expect(Fmt.percent(1e30), "9999%", "far past anything printable")
+    expect(Fmt.percent(-5), "0%", "negative")
+    expect(Fmt.percent(Double(Int.max) * 2), "9999%", "past Int's range")
+    // A real overage is a number, not a fault, and still reads as one.
+    expect(Fmt.percent(150), "150%", "over the limit")
+    expect(Fmt.clampPercent(42.5), 42.5, "an ordinary value passes through untouched")
 
     let now = Date(timeIntervalSince1970: 1_700_000_000)
     expect(Fmt.countdown(to: nil, from: now), "", "no date")
@@ -185,6 +357,27 @@ suite("Fmt") {
     // "US$ 64,20" for a reader in Argentina, so asserting against `.current` would make
     // this pass on one Mac and fail on the next.
     let en = Locale(identifier: "en_US")
+
+    // Memory: whole megabytes below a gigabyte, one decimal above. Binary units, which is
+    // what ri_phys_footprint counts in and what footprint(1) prints.
+    let mb: UInt64 = 1_048_576, gb: UInt64 = 1_073_741_824
+    expect(Fmt.memory(0, locale: en), "0 MB", "nothing")
+    expect(Fmt.memory(1, locale: en), "0 MB", "a single byte still reads as zero")
+    expect(Fmt.memory(137 * mb, locale: en), "137 MB", "the median live session")
+    // No decimals under a gigabyte: a session's footprint drifts by kilobytes constantly
+    // and a tenth of a megabyte would twitch on every scan for nothing.
+    expect(Fmt.memory(137 * mb + 400_000, locale: en), "137 MB", "sub-megabyte drift is invisible")
+    expect(Fmt.memory(137 * mb + 600_000, locale: en), "138 MB", "and rounds rather than truncates")
+    expect(Fmt.memory(999 * mb, locale: en), "999 MB", "just under the switch")
+    expect(Fmt.memory(1023 * mb, locale: en), "1023 MB", "last megabyte")
+    // Rounding happens before the unit is chosen, so nothing ever prints "1024 MB".
+    expect(Fmt.memory(1023 * mb + 900_000, locale: en), "1.0 GB", "rounds up into gigabytes")
+    expect(Fmt.memory(gb, locale: en), "1.0 GB", "exactly one gigabyte")
+    expect(Fmt.memory(1_900_000_000, locale: en), "1.8 GB", "twelve sessions' worth")
+    expect(Fmt.memory(12 * gb, locale: en), "12.0 GB", "double digits")
+    // The decimal separator follows the reader, like `money`. Asserting this against
+    // `.current` is what would make the suite machine-dependent.
+    expect(Fmt.memory(gb, locale: Locale(identifier: "de_DE")), "1,0 GB", "German decimal comma")
     expect(Fmt.money(nil, decimals: 2, currency: "USD", locale: en), nil, "no amount")
     expect(Fmt.money(6420, decimals: 2, currency: "USD", locale: en), "$64.20", "minor units")
     expect(Fmt.money(6420, decimals: nil, currency: nil, locale: en), "$64.20", "defaults")
@@ -272,7 +465,7 @@ suite("UsageResponse.rows") {
 
     // The shape the live endpoint actually returns, trimmed: `is_active` is true on
     // exactly one entry (the highest), and false on a session and a scoped weekly that
-    // both exist. Filtering on it used to collapse this to a single bar.
+    // both exist. Filtering on it would collapse this to a single bar.
     let live = decode("""
     {"five_hour": {"utilization": 45, "resets_at": "2026-07-31T01:40:00.105304+00:00"},
      "seven_day": {"utilization": 76},
@@ -336,6 +529,308 @@ suite("UsageResponse.creditsRow") {
 
     expect(decode("{\"extra_usage\": {\"is_enabled\": false}}").creditsRow()?.percent, nil, "disabled")
     expect(decode("{}").creditsRow()?.percent, nil, "absent")
+}
+
+suite("UsageResponse decoding is lenient") {
+    // The endpoint is undocumented and internal, so the decoder's job is to lose exactly
+    // what broke and nothing else. `Decodable`'s default is the opposite: one unreadable
+    // leaf throws to the top and the whole response goes, including the parts that parsed.
+
+    // A single bad entry costs its own bar and leaves the others standing.
+    let oneBad = decode("""
+    {"limits": [
+      {"kind": "session", "percent": 45},
+      {"kind": "weekly_all", "percent": "seventy-six"},
+      {"kind": "weekly_scoped", "percent": 30, "scope": {"model": {"display_name": "Opus"}}}
+    ]}
+    """)
+    expect(oneBad.rows.map(\.id), ["session", "weekly_scoped-Opus"], "bad entry dropped, rest kept")
+    expect(oneBad.session?.percent, 45, "and the chip still has its number")
+
+    // No percentage means nothing to draw, so that entry alone goes.
+    expect(decode("{\"limits\": [{\"kind\": \"session\"}, {\"kind\": \"weekly_all\", \"percent\": 72}]}")
+            .rows.map(\.id), ["weekly_all"], "an entry with no percent is dropped")
+
+    // Everything except `percent` is tolerated, because the number is what the bar is for.
+    let renamed = decode("{\"limits\": [{\"percent\": 61}]}")
+    expect(renamed.rows.map(\.title), ["Limit"], "a limit with no kind still gets a bar")
+    expect(renamed.rows.map(\.percent), [61], "and keeps its number")
+    expect(decode("{\"limits\": [{\"kind\": 7, \"percent\": 61, \"severity\": [], \"is_active\": \"yes\"}]}")
+            .rows.count, 1, "wrong types on the optional fields are ignored")
+
+    // `limits` changing shape entirely must not cost the fallback the app keeps for
+    // exactly that day.
+    let reshaped = decode("""
+    {"five_hour": {"utilization": 45}, "seven_day": {"utilization": 76},
+     "limits": {"session": 45}}
+    """)
+    expect(reshaped.rows.map(\.id), ["five_hour", "seven_day"], "limits of the wrong shape falls back")
+    expect(reshaped.session?.percent, 45, "fallback still feeds the chip")
+    // Same when every entry is unreadable: an empty list is not a limitless account.
+    expect(decode("{\"five_hour\": {\"utilization\": 45}, \"limits\": [{\"nope\": 1}]}")
+            .rows.map(\.id), ["five_hour"], "all entries dropped falls back too")
+
+    // One broken field inside `extra_usage` costs that field, not the credits row.
+    let partialCredits = decode("""
+    {"extra_usage": {"is_enabled": true, "used_credits": 6420, "monthly_limit": "lots",
+                     "currency": "USD", "decimal_places": 2}}
+    """)
+    let row = partialCredits.creditsRow(locale: Locale(identifier: "en_US"))
+    expect(row?.detail, "$64.20", "spend without a limit to compare it to")
+    // And a broken field deeper down costs only the title's model name.
+    expect(decode("{\"limits\": [{\"kind\": \"weekly_scoped\", \"percent\": 30, \"scope\": {\"model\": 5}}]}")
+            .rows.map(\.title), ["Weekly (scoped)"], "unreadable scope keeps the bar")
+
+    // A percentage is clamped where it enters, so the bar's width, the severity and the
+    // chip all work from a number that can be drawn, compared and converted.
+    let absurd = decode("{\"limits\": [{\"kind\": \"session\", \"percent\": 1e30}]}")
+    expect(absurd.rows.first?.percent, 9999, "an absurd percent is clamped in the row")
+    expect(absurd.session?.percent, 9999, "and in the gauge")
+    expect(Fmt.percent(absurd.session?.percent ?? -1), "9999%", "and survives the menu bar")
+    expect(decode("{\"limits\": [{\"kind\": \"session\", \"percent\": -20}]}").rows.first?.percent,
+           0, "a negative percent is floored")
+}
+
+// MARK: - Menu bar chips
+
+suite("UsageModel.agentsChipText") {
+    // The fraction is the point of the feature: seven sessions open and one working is
+    // exactly what the menu bar could not say before.
+    expect(UsageModel.agentsChipText(total: 7, active: 1), "1/7", "some working")
+    expect(UsageModel.agentsChipText(total: 7, active: 0), "0/7", "none working")
+    // "7/7" and "1/1" spend width to say nothing, so they collapse to the bare count.
+    expect(UsageModel.agentsChipText(total: 7, active: 7), "7", "all working")
+    expect(UsageModel.agentsChipText(total: 1, active: 1), "1", "a single working session")
+    expect(UsageModel.agentsChipText(total: 1, active: 0), "1", "a single idle session")
+    // Defensive: the classifier cannot mark more than it was given, but the chip must not
+    // invent "8/7" if it ever does.
+    expect(UsageModel.agentsChipText(total: 7, active: 9), "7", "more active than total")
+}
+
+suite("UsageModel.segments") {
+    func chips(_ usage: UsageResponse?,
+               _ mode: UsageModel.TitleMode = .sessionAndWeek,
+               error: String? = nil,
+               agents: Int = 0,
+               active: Int = 0,
+               showAgents: Bool = true) -> [StatusIcon.Segment] {
+        UsageModel.segments(usage: usage, titleMode: mode, errorText: error,
+                            agentCount: agents, activeAgentCount: active,
+                            showAgents: showAgents)
+    }
+    func seg(_ text: String, _ severity: Severity = .normal,
+             _ symbol: String? = nil) -> StatusIcon.Segment {
+        StatusIcon.Segment(text: text, severity: severity, symbol: symbol)
+    }
+
+    let usage = decode("""
+    {"limits": [
+      {"kind": "session", "percent": 45, "severity": "normal"},
+      {"kind": "weekly_all", "percent": 76, "severity": "warning"}
+     ],
+     "extra_usage": {"is_enabled": true, "monthly_limit": 10000, "used_credits": 9500,
+                     "utilization": 95, "currency": "USD", "decimal_places": 2}}
+    """)
+
+    expect(chips(usage), [seg("45%"), seg("76%", .warning)], "session + week")
+    expect(chips(usage, .session), [seg("45%")], "session only")
+    expect(chips(usage, .week), [seg("76%", .warning)], "week only")
+    expect(chips(usage, .credits), [seg("95%", .critical)], "extra usage")
+    expect(chips(usage, .iconOnly), [], "icon only")
+    expect(chips(usage, .highest), [seg("76%", .warning)], "highest picks the larger")
+    // The severity travels with the value rather than being re-derived from it: this
+    // weekly is at 30% and already flagged, and the chip has to agree with its bar.
+    let escalated = decode("""
+    {"limits": [{"kind": "weekly_all", "percent": 30, "severity": "critical"}]}
+    """)
+    expect(chips(escalated, .week), [seg("30%", .critical)], "api severity reaches the chip")
+
+    // Nothing fetched yet and nothing wrong: one chip carries the state.
+    expect(chips(nil), [seg("…")], "loading")
+    // An error replaces it rather than joining it, so the bar never shows both.
+    expect(chips(nil, error: "boom"), [seg("!", .critical)], "error before any data")
+    // But with cached numbers on screen the `!` is appended: without it an expired token
+    // leaves yesterday's percentages up with the only warning buried in the panel.
+    expect(chips(usage, error: "Session expired"),
+           [seg("45%"), seg("76%", .warning), seg("!", .critical)], "error beside stale numbers")
+    expect(chips(usage, .iconOnly, error: "boom"), [seg("!", .critical)], "error survives icon only")
+
+    // The agents chip is last, carries its glyph, and is absent when there is nothing to
+    // count or the user turned it off.
+    expect(chips(usage, .session, agents: 3, active: 1),
+           [seg("45%"), seg("1/3", .normal, "figure.run")], "agents chip")
+    expect(chips(usage, .session, agents: 3, active: 3),
+           [seg("45%"), seg("3", .normal, "figure.run")], "all of them working")
+    expect(chips(usage, .session, agents: 0), [seg("45%")], "no agents running")
+    expect(chips(usage, .session, agents: 3, showAgents: false), [seg("45%")], "agents chip off")
+    // "Icon only" means no chip, including the loading one: it is not a warning, so
+    // there is nothing lost by honoring the setting. The `!` is the exception, and the
+    // agents chip has its own switch.
+    expect(chips(nil, .iconOnly), [], "icon only stays bare while loading")
+    expect(chips(nil, .iconOnly, agents: 2, active: 2), [seg("2", .normal, "figure.run")],
+           "agents alone")
+
+    // A mode whose value the account does not have shows nothing rather than a zero.
+    let sessionOnly = decode("{\"limits\": [{\"kind\": \"session\", \"percent\": 45}]}")
+    expect(chips(sessionOnly, .credits), [], "extra usage not enabled")
+    expect(chips(sessionOnly, .week), [], "no weekly limit")
+    expect(chips(sessionOnly, .highest), [seg("45%")], "highest of one")
+}
+
+suite("UsageModel.TitleMode") {
+    // The raw values are a persistence format: they are what lands in UserDefaults, so
+    // renaming a case silently resets everyone's menu bar to the default.
+    expect(UsageModel.TitleMode.allCases.map(\.rawValue),
+           ["sessionAndWeek", "session", "week", "highest", "credits", "iconOnly"], "raw values")
+    expect(UsageModel.TitleMode(rawValue: "highest"), .highest, "round trip")
+    expect(UsageModel.TitleMode(rawValue: "gone"), nil, "unknown value falls back")
+    expect(UsageModel.TitleMode.allCases.map(\.id), UsageModel.TitleMode.allCases.map(\.rawValue),
+           "id is the raw value")
+    expectTrue(UsageModel.TitleMode.allCases.allSatisfy { !$0.label.isEmpty },
+               "every case is labelled")
+}
+
+// MARK: - Rate limiting
+
+suite("UsageModel.retryAfterSeconds") {
+    let now = Date(timeIntervalSince1970: 1_785_412_800)   // 2026-07-30T12:00:00Z
+    expect(UsageModel.retryAfterSeconds("120", now: now), 120, "seconds")
+    expect(UsageModel.retryAfterSeconds(" 90 ", now: now), 90, "padded seconds")
+    // What the endpoint actually sends while it is still refusing requests, which is why
+    // this is only ever a lower bound (see `throttleDelay`).
+    expect(UsageModel.retryAfterSeconds("0", now: now), 0, "zero")
+    expect(UsageModel.retryAfterSeconds(nil, now: now), 0, "header absent")
+    expect(UsageModel.retryAfterSeconds("", now: now), 0, "header empty")
+    expect(UsageModel.retryAfterSeconds("banana", now: now), 0, "unparseable")
+    // The other form RFC 7231 allows.
+    expect(UsageModel.retryAfterSeconds("Wed, 30 Jul 2026 12:01:00 GMT", now: now), 60, "http date")
+    expect(UsageModel.retryAfterSeconds("Wed, 30 Jul 2026 11:59:00 GMT", now: now), -60,
+           "http date already past")
+}
+
+suite("UsageModel.throttleDelay") {
+    // 60s, 2m, 4m, 8m, then the ceiling. A single blip recovers on the next tick; a
+    // sustained window stops being retried into, which is what lets it close at all.
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: 0), 60, "first")
+    expect(UsageModel.throttleDelay(consecutive429: 2, advertised: 0), 120, "second")
+    expect(UsageModel.throttleDelay(consecutive429: 3, advertised: 0), 240, "third")
+    expect(UsageModel.throttleDelay(consecutive429: 4, advertised: 0), 480, "fourth")
+    expect(UsageModel.throttleDelay(consecutive429: 5, advertised: 0), 900, "clamped at maxThrottle")
+    // The counter is a count, not an index: it is read before the first bump lands.
+    expect(UsageModel.throttleDelay(consecutive429: 0, advertised: 0), 60, "zero counts as the first")
+    // `Retry-After` can lengthen the wait, never shorten it.
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: 300), 300, "advertised above the floor")
+    expect(UsageModel.throttleDelay(consecutive429: 3, advertised: 100), 240, "advertised below the floor")
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: -100), 60, "negative advertised")
+    // And a bogus one cannot park the app for a day.
+    expect(UsageModel.throttleDelay(consecutive429: 1, advertised: 86_400), 900, "absurd advertised")
+}
+
+suite("UsageModel.pollDelay") {
+    let now = Date(timeIntervalSince1970: 1_785_412_800)
+    expect(UsageModel.pollDelay(refreshInterval: 60, throttledUntil: nil, now: now), 60, "no backoff")
+    // Just past the moment it expires, so a countdown reaching zero is followed by an
+    // actual attempt instead of the rest of a 15 minute sleep.
+    expect(UsageModel.pollDelay(refreshInterval: 900, throttledUntil: now.addingTimeInterval(30),
+                                now: now), 31, "wakes just after the backoff")
+    // But never longer than the user's interval.
+    expect(UsageModel.pollDelay(refreshInterval: 60, throttledUntil: now.addingTimeInterval(600),
+                                now: now), 60, "capped by the interval")
+    // A spent backoff falls back to the floor rather than to zero: a tight loop here is
+    // exactly what holds the window open.
+    expect(UsageModel.pollDelay(refreshInterval: 900, throttledUntil: now.addingTimeInterval(-5),
+                                now: now), 25, "spent backoff waits the floor")
+    expect(UsageModel.pollDelay(refreshInterval: 900, throttledUntil: now, now: now), 25,
+           "exactly expired")
+    expect(UsageModel.pollDelay(refreshInterval: 15, throttledUntil: now.addingTimeInterval(-5),
+                                now: now), 15, "floor never exceeds the interval")
+}
+
+suite("UsageModel.fetchAllowedAt") {
+    let now = Date(timeIntervalSince1970: 1_785_412_800)
+    expect(UsageModel.fetchAllowedAt(lastAttempt: nil, throttledUntil: nil), nil, "nothing yet")
+    // Measured from the attempt, not from the last success: a relaunch restores its
+    // numbers from the cache on disk and must still be allowed to fetch immediately.
+    expect(UsageModel.fetchAllowedAt(lastAttempt: now, throttledUntil: nil),
+           now.addingTimeInterval(25), "floor after an attempt")
+    expect(UsageModel.fetchAllowedAt(lastAttempt: nil, throttledUntil: now.addingTimeInterval(300)),
+           now.addingTimeInterval(300), "backoff only")
+    // Whichever is later wins, in both directions.
+    expect(UsageModel.fetchAllowedAt(lastAttempt: now, throttledUntil: now.addingTimeInterval(300)),
+           now.addingTimeInterval(300), "backoff outlasts the floor")
+    expect(UsageModel.fetchAllowedAt(lastAttempt: now, throttledUntil: now.addingTimeInterval(-300)),
+           now.addingTimeInterval(25), "floor outlasts a spent backoff")
+}
+
+// MARK: - Status item image
+
+suite("StatusIcon.statusImage") {
+    func image(_ segments: [StatusIcon.Segment]) -> NSImage {
+        StatusIcon.statusImage(segments: segments, appearance: nil)
+    }
+    let normal = StatusIcon.Segment(text: "45%", severity: .normal)
+    let warning = StatusIcon.Segment(text: "76%", severity: .warning)
+    let critical = StatusIcon.Segment(text: "99%", severity: .critical)
+
+    // A template image is tinted by the menu bar, which is how light and dark come for
+    // free. As soon as one value needs a color of its own the whole image stops being one.
+    expectTrue(image([normal]).isTemplate, "all normal draws as a template")
+    expectTrue(image([]).isTemplate, "icon only is a template")
+    expect(image([normal, warning]).isTemplate, false, "one warning drops the template")
+    expect(image([critical]).isTemplate, false, "critical drops the template")
+    expect(image([warning, critical]).isTemplate, false, "worst of several decides")
+
+    // The menu bar height is fixed; only the width follows the contents.
+    expect(image([normal]).size.height, 18, "fixed height")
+    expectTrue(image([normal, warning]).size.width > image([normal]).size.width,
+               "a second chip is wider")
+    expectTrue(image([normal]).size.width > image([]).size.width, "the mark alone is narrowest")
+
+    // VoiceOver reads the image, so the values have to be in its description or the status
+    // item announces itself without saying anything.
+    let spoken = image([normal, StatusIcon.Segment(text: "4", severity: .normal,
+                                                   symbol: "figure.run")]).accessibilityDescription
+    expect(spoken, "Claude Code usage, 45%, 4 agents", "spoken description")
+    expect(image([]).accessibilityDescription, "Claude Code usage", "nothing to read out")
+}
+
+// MARK: - Credentials
+
+suite("Credentials.parse") {
+    func parse(_ json: String) -> String? { Credentials.parse(Data(json.utf8)) }
+
+    expect(parse("{\"claudeAiOauth\": {\"accessToken\": \"sk-ant-oat01-abc\"}}"),
+           "sk-ant-oat01-abc", "token")
+    // Every shape that is not a usable token has to read as "no credentials". An empty
+    // one would go out as a `Bearer ` header with nothing behind it and come back a 401,
+    // which the panel then blames on an expired session.
+    expect(parse("{\"claudeAiOauth\": {\"accessToken\": \"\"}}"), nil, "empty token")
+    expect(parse("{\"claudeAiOauth\": {}}"), nil, "no token field")
+    expect(parse("{\"claudeAiOauth\": {\"accessToken\": 12345}}"), nil, "token is not a string")
+    expect(parse("{\"other\": {\"accessToken\": \"x\"}}"), nil, "wrong key")
+    expect(parse("[]"), nil, "not an object")
+    expect(parse("not json at all"), nil, "garbage")
+    expect(Credentials.parse(Data()), nil, "empty data")
+}
+
+// MARK: - Login item
+
+suite("LoginItem.isInstalled") {
+    func installed(_ path: String) -> Bool {
+        LoginItem.isInstalled(bundlePath: path, home: "/Users/andres")
+    }
+    expectTrue(installed("/Applications/ClaudeUsage.app"), "system Applications")
+    expectTrue(installed("/Users/andres/Applications/ClaudeUsage.app"), "home Applications")
+    expectTrue(installed("/Applications/Utilities/ClaudeUsage.app"), "nested under Applications")
+    // `SMAppService` remembers the path it was registered from, so offering this from a
+    // build directory leaves a login item pointing at something `make clean` deletes.
+    expect(installed("/Users/andres/code/claude-usage-bar/build/ClaudeUsage.app"), false,
+           "running from build/")
+    // A directory check, not a string prefix.
+    expect(installed("/Applications Backup/ClaudeUsage.app"), false, "similarly named folder")
+    expect(installed("/Applications"), false, "the folder itself")
+    expect(installed("/Users/someone-else/Applications/ClaudeUsage.app"), false,
+           "another user's home")
 }
 
 // MARK: - Result
