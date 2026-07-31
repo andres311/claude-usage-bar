@@ -32,7 +32,7 @@ would not move (writes land in `Contents/`) and every `make` would rebuild. `Res
 is a prerequisite too, otherwise swapping the menu bar mark never triggers a rebuild.
 
 `make test` is the one exception: it compiles **every source but `App.swift`** with
-`Tests/main.swift` into a command line binary and runs it (178 checks, about a second).
+`Tests/main.swift` into a command line binary and runs it (255 checks, about a second).
 `App.swift` is left out because its `@main` cannot coexist with top-level code, and what
 it holds is `NSStatusItem`/`NSPopover` wiring that means nothing without a running app.
 There is no XCTest: the harness is twenty lines at the top of `Tests/main.swift`, and because
@@ -40,10 +40,11 @@ it is top-level code the file has to be called `main.swift` and cannot be compil
 `-parse-as-library`.
 
 What is covered: the process-table rules (`isAgent`, `hostName`, `precedes`,
-`sameOnScreen`, `humanElapsed`), severity, `Fmt`, the derived rows and gauges, the menu
-bar chips (`UsageModel.segments`), the whole 429 policy (`retryAfterSeconds`,
-`throttleDelay`, `pollDelay`, `fetchAllowedAt`), `StatusIcon.statusImage`'s template rule
-and accessibility description, `Credentials.parse` and `LoginItem.isInstalled`.
+`sameOnScreen`, `humanElapsed`), severity, `Fmt`, the derived rows and gauges, **how the
+decoder degrades** when the response changes shape, the menu bar chips
+(`UsageModel.segments`), the whole 429 policy (`retryAfterSeconds`, `throttleDelay`,
+`pollDelay`, `fetchAllowedAt`), `StatusIcon.statusImage`'s template rule and accessibility
+description, `Credentials.parse` and `LoginItem.isInstalled`.
 
 **The dividing line is the main actor and the outside world.** Everything above is
 reachable as a plain function taking its inputs; what is left untested needs a live
@@ -148,6 +149,14 @@ so nobody reads them as a state the app can be in.
     `elapsed` moves on every scan by definition, so a plain equality check would publish
     once a second while the panel is open and re-run `UsageView.body` on a timer, which is
     the one thing the separate `Clock` exists to prevent.
+  - **A scan carries the instant it was taken (`applyScan(_:takenAt:)`), and an older one is
+    dropped.** Two can be in flight at once - the loop's, and the off-cycle `scanAgentsNow`
+    the panel fires as it opens - and nothing orders their completions. Whichever landed
+    second used to become the baseline, so a stale set of CPU counters got filed under a
+    fresh timestamp and the next `dt` came out shorter than the interval those counters
+    actually covered: a burst of activity that never happened, and idle sessions blinking
+    "working" for a grace period. Both loops now go through `scanAndApply`, which stamps the
+    result where it is read, and `takenAt` is what `classify` gets as `now` as well.
   - `refresh()` takes **no `force`**. It used to, and the panel's button passed it, which
     made clicking that button repeatedly the one supported way to walk straight into the
     5-minute 429 window - and retrying inside the window is what holds it open. The floor
@@ -170,7 +179,15 @@ so nobody reads them as a state the app can be in.
   - `authExpired` is set by a 401/403 and cleared **only** by a 200. The 429 branch clears
     `errorText`, and without that flag a rate limit landing after an expired token wiped
     the "Session expired" message and with it the `!` chip - the only thing on the menu bar
-    saying the numbers had stopped being true.
+    saying the numbers had stopped being true. **The `catch` branch honors it too**, for
+    exactly the same reason: a network blip while the token is expired must not replace that
+    message with "The Internet connection appears to be offline."
+  - `clearThrottle()` (`throttledUntil = nil`, `consecutive429 = 0`) runs on **every branch
+    that got an HTTP status other than 429** - the 200, the 401/403 and the `default` - and
+    deliberately not from `catch`. Receiving any status at all is proof the endpoint has
+    stopped refusing us, so the doubling has to start over; a 401 arriving after two 429s
+    used to leave the counter at 2 and the next blip started at 4 minutes instead of one.
+    A failed request proves nothing either way, so it leaves the backoff untouched.
   - **The gear menu is unusable if the panel redraws while it is open.** A SwiftUI `Menu`
     is an `NSMenu`; re-running `UsageView.body` rebuilds its items under the pointer, so
     the "Refresh every" submenu flickered open and shut and swallowed the click. Two
@@ -218,12 +235,32 @@ so nobody reads them as a state the app can be in.
   - Because argv is a real vector rather than a space-joined line, an install path with a
     space in it needs no reconstruction: that whole class of ambiguity, and the
     `exists`-probing heuristic that guessed where argv[0] ended, left with `ps`.
+  - Every argument is built with `String(decoding:as:)` over its own bytes, **not** by
+    pointing `String(cString:)` at the shared buffer. The slice stops before the terminator,
+    so the C-string read ran one byte past the bounds it was given and only found a NUL
+    because the parent array happened to hold one, and it force-unwrapped a base address the
+    standard library does not promise is non-nil for the empty slice an empty argument
+    (`claude ""`) produces. It worked; it worked by luck, and the compiler deprecates the
+    array spelling for that exact reason. `execPath` cuts at the terminator with
+    `prefix(while:)` for the same reason.
   - `isAgent` deliberately ignores argv[0]. It only disagrees with the exec path when
     something else launched the process, and then it does not name `claude` either: a
     `#!/bin/sh` wrapper called `claude` arrives as `execPath: /bin/bash`,
     `argv: ["/bin/sh", "./claude"]`, which is the same non-match as before.
+  - Behind an interpreter, **any** argument that names `claude` counts, not just the first
+    one without a dash. "First non-flag argument" is only node's rule for flags that stand
+    alone: a value-taking one (`node -r ./polyfill /…/claude`, `node --import ./hook.mjs
+    /…/claude`) puts its value exactly where the script was expected, so the session was
+    missed outright. Widening it exposes nothing new, since reaching that line at all means
+    the executable is already a known interpreter.
   - `hostName` matches `-p` / `--print` as whole argv entries rather than substrings, so
     neither a directory called `my-print` nor a prompt containing " -p " is a headless run.
+    **The IDE markers follow the same rule, one level up.** They used to be matched against
+    the executable and the whole argument vector flattened into a single line, which made
+    `claude -p "fix the .vscode/extensions loader"` a VS Code session: a prompt is an argv
+    entry like any other. Only the executable (a path by definition, spaces included) and
+    arguments that *look* like a path - a slash and no whitespace - are searched now, which
+    is what separates a location on disk from prose.
   - `allPids` retries when the read exactly fills its buffer: that may have been truncated,
     and a truncated table silently under-counts agents. After three tries it answers `nil`
     ("could not read"), never a short list.
@@ -310,6 +347,31 @@ so nobody reads them as a state the app can be in.
   not stable, and an index-based id makes SwiftUI rebind a row onto a different limit
   when the API reorders two entries of the same rank. `group` is deliberately excluded
   from the id, every weekly entry shares `group: "weekly"`.
+  - **Nothing in the decoder trusts the response's shape, and that takes real code.**
+    Declaring the fields optional is not enough: `Decodable`'s default is that one leaf it
+    cannot read throws all the way to the top, so a single limit entry with a renamed
+    `percent` used to cost the entire response - the other three bars, the credits row, and
+    the `five_hour`/`seven_day` fallback that exists for exactly that day. Every container
+    therefore decodes field by field through the `lenient` helper (`decodeIfPresent` that
+    answers `nil` instead of throwing), and `limits` decodes element by element through
+    `Lenient<T>`, whose `init(from:)` swallows the failure while the unkeyed container still
+    advances past the element. The result: a wrong type costs its field, a bad entry costs
+    its own bar, `limits` arriving as an object costs nothing but falls back.
+  - `percent` is the **one** field whose absence drops an entry, because a limit with no
+    percentage has nothing to draw. `kind` defaults to `""` instead: it decides the title
+    and the sort position, and neither is worth losing a bar over (`title(for:)` prints
+    "Limit" rather than an empty label).
+  - **`Fmt.percent` clamps, and that is not tidiness.** `Int(_: Double)` *traps* on NaN and
+    on anything outside `Int`'s range, so a `percent` of `1e30` - valid JSON, an entirely
+    ordinary `Double` once decoded - killed the app the next time the menu bar redrew.
+    `Fmt.clampPercent` is applied where percentages **enter** (`Gauge.init`, `UsageRow.init`)
+    rather than where they are printed, so the bar's width, the severity comparison and the
+    chip all work from the same sane value.
+  - The two `ISO8601DateFormatter`s are guarded by `isoLock`, exactly like
+    `currencyFormatter`. They had no lock on the reasoning that `Fmt.date` is only reached
+    from the panel's body: true today, and not a property of this code, since nothing stops
+    a `nonisolated static` from calling it off the main actor tomorrow. `-swift-version 6`
+    rejects the unguarded form, and the sources are clean under it.
   - **`is_active` is not a filter.** It used to be treated as "the account has this
     limit", which was wrong and hid real bars. Measured against a live account it comes
     back `false` on a session at 45% whose reset time is in the future *and* on the
@@ -368,7 +430,9 @@ The response also carries a `spend` object that duplicates `extra_usage` in a ne
 and a set of always-null codenamed fields (`tangelo`, `nimbus_quill`, …). Neither is read.
 
 This is an undocumented internal endpoint (the one behind `/usage`); field names can
-change without notice. Everything is optional in the decoder for that reason.
+change without notice. The decoder degrades field by field and entry by entry for that
+reason - see the `Models.swift` notes above, and do not "simplify" it back to a synthesized
+`init(from:)`, which loses everything on the first unreadable leaf.
 
 **Rate limiting is the main constraint.** It answers `429` with `Retry-After` (~5 minute
 windows) if polled every few seconds. Keep the 25s `minFetchGap` floor, the
@@ -414,6 +478,15 @@ picks it up.
   deliberately has no watchdog either, because the block it can hit is the keychain ACL
   prompt, and that block is the user being asked a question. Do not add a second
   subprocess to the scan path: see `AgentsMonitor`.
+- **`Int(_: Double)` traps**, on NaN and on anything outside `Int`'s range. Every number
+  that reaches one comes off an endpoint that can send whatever it likes, so it goes
+  through `Fmt.clampPercent` first. This is the one bug class here that is a hard crash
+  rather than a wrong pixel, and it is invisible until the day the API sends something odd.
+- The sources typecheck clean under `-swift-version 6`
+  (`swiftc -typecheck -parse-as-library -swift-version 6 Sources/*.swift -framework AppKit
+  -framework SwiftUI -framework ServiceManagement`). The build itself is Swift 5 mode, so
+  that check is worth running by hand after touching anything shared across tasks: it is
+  what caught the two unguarded `ISO8601DateFormatter`s.
 - Menu bar text uses `NSFont.monospacedDigitSystemFont` so the width does not jitter, and
   semantic `NSColor`s so it adapts to light/dark menu bars.
 - Status item colors: green/default under 75%, orange 75-90%, red above 90%. When the API

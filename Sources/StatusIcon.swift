@@ -30,7 +30,10 @@ enum StatusIcon {
     private static let symbolSize: CGFloat = 9
     private static let symbolGap: CGFloat = 3
 
-    private static let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+    /// `NSFont` is immutable once built but not `Sendable`, so the annotation says out loud
+    /// what this already relies on: built once, only ever read.
+    nonisolated(unsafe) private static let font =
+        NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
 
     /// Status item image for `segments`.
     ///
