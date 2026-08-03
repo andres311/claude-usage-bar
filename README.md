@@ -173,14 +173,14 @@ Sources/
 Resources/
   claude-mark.png      the menu bar mark, copied into the .app at build time
 Tests/
-  main.swift           268 logic checks, `make test`
+  main.swift           307 logic checks, `make test`
 docs/                  the screenshots on this page (folder names painted over)
 build.sh               compiles both arches, lipos, bundles and ad-hoc signs the .app
 Makefile               build / test / install / run / zip / clean / uninstall
 ```
 
 `make test` compiles every source except `App.swift` together with `Tests/main.swift` into
-a plain command line binary and runs it: 268 checks in about a second. No XCTest and no
+a plain command line binary and runs it: 307 checks in about a second. No XCTest and no
 test target, for the same reason there is no Xcode project.
 
 It covers the parts that are easy to get quietly wrong: which processes count as an agent
@@ -188,9 +188,10 @@ and how they are sorted, the severity thresholds, date and money formatting, the
 derived from the API response, how the decoder degrades when the response changes shape,
 the menu bar chips in every display mode, the whole 429 backoff (doubling, ceiling,
 `Retry-After` as a lower bound, the floor between requests), the status image's template
-rule and its VoiceOver description, the credentials parser, and the login-item eligibility
-check. What is left out is what needs a live socket, the real process table or a running
-status item.
+rule and its VoiceOver description, the credentials parser with its expiry field, what a
+refused login does and does not justify withholding a request over, and the login-item
+eligibility check. What is left out is what needs a live socket, the real process table or
+a running status item.
 
 ## Caveats
 
