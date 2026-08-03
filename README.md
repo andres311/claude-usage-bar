@@ -121,8 +121,19 @@ quarantine flag.
 
 The token is read at request time from the login keychain item `Claude Code-credentials`
 (falling back to `~/.claude/.credentials.json`), the same one the `claude` CLI uses. It is
-never written to disk or logged by this app. When it expires, the panel asks you to open
-Claude Code, which refreshes it; the app then picks up the new token automatically.
+never written to disk or logged by this app.
+
+That token lasts hours and only Claude Code renews it, when it next makes a request. So a
+stretch of not using `claude` is enough for it to lapse while you are still perfectly
+logged in, and the panel says so in those words: **"Waiting for Claude Code to refresh the
+login (token expired 12m ago)"**. Run any `claude` command and the next poll picks up the
+new token on its own. The shorter **"Session expired. Open Claude Code to refresh the
+login."** is the other case, a login refused while it should still have been valid.
+
+Once a token has been refused *and* is past its own expiry, the app stops sending requests
+with it: they can only come back `401` and would spend the rate-limit budget below for
+nothing. It starts again the moment the keychain holds a different token. A `401` on a
+token that should still be valid keeps being retried, since that one can be transient.
 
 ## Refresh rate
 
@@ -162,14 +173,14 @@ Sources/
 Resources/
   claude-mark.png      the menu bar mark, copied into the .app at build time
 Tests/
-  main.swift           268 logic checks, `make test`
+  main.swift           307 logic checks, `make test`
 docs/                  the screenshots on this page (folder names painted over)
 build.sh               compiles both arches, lipos, bundles and ad-hoc signs the .app
 Makefile               build / test / install / run / zip / clean / uninstall
 ```
 
 `make test` compiles every source except `App.swift` together with `Tests/main.swift` into
-a plain command line binary and runs it: 268 checks in about a second. No XCTest and no
+a plain command line binary and runs it: 307 checks in about a second. No XCTest and no
 test target, for the same reason there is no Xcode project.
 
 It covers the parts that are easy to get quietly wrong: which processes count as an agent
@@ -177,9 +188,10 @@ and how they are sorted, the severity thresholds, date and money formatting, the
 derived from the API response, how the decoder degrades when the response changes shape,
 the menu bar chips in every display mode, the whole 429 backoff (doubling, ceiling,
 `Retry-After` as a lower bound, the floor between requests), the status image's template
-rule and its VoiceOver description, the credentials parser, and the login-item eligibility
-check. What is left out is what needs a live socket, the real process table or a running
-status item.
+rule and its VoiceOver description, the credentials parser with its expiry field, what a
+refused login does and does not justify withholding a request over, and the login-item
+eligibility check. What is left out is what needs a live socket, the real process table or
+a running status item.
 
 ## Caveats
 
