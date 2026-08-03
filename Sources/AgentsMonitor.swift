@@ -213,9 +213,15 @@ enum AgentsMonitor {
     ///
     /// It gets a constant of its own because what it measures is not the same quantity: the
     /// number includes the guest's kernel, its timers and the VM's own device emulation, all
-    /// of which keep running with nobody typing. Measured the same way and over the same 10s
-    /// windows (CLAUDE.md), it happens to land on the same figure, and that agreement is a
-    /// result rather than a reason to share the constant.
+    /// of which keep running with nobody typing. Landing on the same figure as
+    /// `activeThreshold` is a result, not a reason to share one constant.
+    ///
+    /// Measured over 10s windows on a live idle guest, n=128: median 0.80% of a core, p95
+    /// 0.90%, p99 1.00%. One sample of the 128 reached 4.1%, and that outlier is the known
+    /// cost of this number: a single spike marks the row working for the 45s the hysteresis
+    /// holds. It stays at 2% anyway, because raising it to clear an outlier trades a rare
+    /// false "working" for the failure that matters more - a session that really is working
+    /// reading idle. See CLAUDE.md for what is still unmeasured here.
     static let vmActiveThreshold: Double = 0.02
 
     /// Which threshold applies to a row. `classify` asks per agent rather than per scan,
