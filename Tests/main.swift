@@ -475,6 +475,21 @@ suite("Fmt") {
     expect(Fmt.countdown(to: now.addingTimeInterval(12 * 60), from: now), "12m", "minutes")
     expect(Fmt.countdown(to: now.addingTimeInterval(3 * 3600 + 49 * 60), from: now), "3h 49m", "hours")
     expect(Fmt.countdown(to: now.addingTimeInterval(2 * 86_400 + 3 * 3600), from: now), "2d 3h", "days")
+    // The last fraction of a second still reads "now" rather than rounding up to "1m",
+    // which is what the whole-second truncation used to do before `duration` was split out.
+    expect(Fmt.countdown(to: now.addingTimeInterval(0.4), from: now), "now", "under a second left")
+
+    // `duration` is the same arithmetic without a zero case: a countdown that has run out
+    // says "now", but an age that rounds down to nothing still happened.
+    expect(Fmt.duration(0), "1m", "never zero")
+    expect(Fmt.duration(-30), "1m", "a negative span is not a countdown, it is a bad input")
+    expect(Fmt.duration(12 * 60), "12m", "minutes")
+    expect(Fmt.duration(3 * 3600 + 49 * 60), "3h 49m", "hours")
+    expect(Fmt.duration(2 * 86_400 + 3 * 3600), "2d 3h", "days")
+    // `Int(_: Double)` traps on both of these, and both are reachable: the dates behind
+    // these spans come off an endpoint that can send whatever it likes.
+    expect(Fmt.duration(.nan), "0m", "NaN cannot reach Int(_:)")
+    expect(Fmt.duration(1e30), "36458d 8h", "clamped rather than trapped")
 
     // Pinned to en_US rather than the machine's locale: the panel *should* render
     // "US$ 64,20" for a reader in Argentina, so asserting against `.current` would make
@@ -940,7 +955,7 @@ suite("StatusIcon.statusImage") {
 // MARK: - Credentials
 
 suite("Credentials.parse") {
-    func parse(_ json: String) -> String? { Credentials.parse(Data(json.utf8)) }
+    func parse(_ json: String) -> String? { Credentials.parse(Data(json.utf8))?.value }
 
     expect(parse("{\"claudeAiOauth\": {\"accessToken\": \"sk-ant-oat01-abc\"}}"),
            "sk-ant-oat01-abc", "token")
@@ -953,7 +968,120 @@ suite("Credentials.parse") {
     expect(parse("{\"other\": {\"accessToken\": \"x\"}}"), nil, "wrong key")
     expect(parse("[]"), nil, "not an object")
     expect(parse("not json at all"), nil, "garbage")
-    expect(Credentials.parse(Data()), nil, "empty data")
+    expect(Credentials.parse(Data())?.value, nil, "empty data")
+}
+
+suite("Credentials expiry") {
+    func expiry(_ json: String) -> Date? {
+        Credentials.parse(Data(json.utf8))?.expiresAt
+    }
+    func value(_ json: String) -> String? { Credentials.parse(Data(json.utf8))?.value }
+
+    // Milliseconds since the epoch, which is how Claude Code writes it. A whole-second
+    // value so the assertion is an exact date and not a float comparison.
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": 1785797331000}}"),
+           Date(timeIntervalSince1970: 1_785_797_331), "milliseconds")
+    // And the real thing, fractional milliseconds included, to a millisecond.
+    let fractional = expiry(
+        "{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": 1785797331466}}")
+    expectTrue(abs((fractional?.timeIntervalSince1970 ?? 0) - 1_785_797_331.466) < 0.001,
+               "the timestamp Claude Code actually writes")
+    // Losing the timestamp costs the wording of one message. It must never cost the token,
+    // which is the difference between "waiting for a refresh" and "no credentials found".
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\"}}"), nil, "absent")
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": \"soon\"}}"),
+           nil, "not a number")
+    expect(value("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": \"soon\"}}"),
+           "t", "an unreadable expiry still yields the token")
+
+    // A *seconds* timestamp in a milliseconds field is January 1970, and the panel would
+    // announce a login that expired 56 years ago. The unit is not guessed from the
+    // magnitude either: guessing wrong is off by a factor of 1000 the other way.
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": 1785797331}}"),
+           nil, "seconds, not milliseconds")
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": 0}}"), nil, "zero")
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": -1785797331466}}"),
+           nil, "negative")
+    expect(expiry("{\"claudeAiOauth\": {\"accessToken\": \"t\", \"expiresAt\": true}}"),
+           nil, "a boolean bridges to a number and must still be refused")
+    // NaN and infinity cannot be written as JSON literals, but `expiry` is the one place
+    // that would turn either into a Date every comparison is false against.
+    expect(Credentials.expiry(Double.nan), nil, "NaN")
+    expect(Credentials.expiry(Double.infinity), nil, "infinity")
+    expect(Credentials.expiry(nil), nil, "nothing at all")
+}
+
+suite("Credentials.Token.fingerprint") {
+    func fp(_ token: String) -> String {
+        Credentials.Token(value: token, expiresAt: nil).fingerprint
+    }
+    // Stable across reads, so a keychain item that has not changed is not mistaken for a
+    // new login on every poll.
+    expect(fp("sk-ant-oat01-abc"), fp("sk-ant-oat01-abc"), "same token, same fingerprint")
+    expectTrue(fp("sk-ant-oat01-abc") != fp("sk-ant-oat01-abd"), "one character apart")
+    // 16 hex digits of SHA-256, and above all not the token: this is the only form of it
+    // the model keeps between requests.
+    expect(fp("sk-ant-oat01-abc").count, 16, "truncated digest")
+    expectTrue(fp("sk-ant-oat01-abc").allSatisfy(\.isHexDigit), "hex")
+    expectTrue(!fp("sk-ant-oat01-abc").contains("sk-ant"), "carries none of the secret")
+    expect(fp(""), "e3b0c44298fc1c14", "pinned against SHA-256 of the empty string")
+}
+
+// MARK: - Auth policy
+
+suite("UsageModel.tokenAction") {
+    let now = Date(timeIntervalSince1970: 1_785_800_000)
+    let past = now.addingTimeInterval(-600), future = now.addingTimeInterval(600)
+    let a = Credentials.Token(value: "token-a", expiresAt: nil).fingerprint
+    let b = Credentials.Token(value: "token-b", expiresAt: nil).fingerprint
+    func action(_ fingerprint: String, _ expiresAt: Date?,
+                rejected: String?) -> UsageModel.TokenAction {
+        UsageModel.tokenAction(fingerprint: fingerprint, expiresAt: expiresAt,
+                               rejected: rejected, now: now)
+    }
+    expect(action(a, past, rejected: nil), .send, "nothing has been refused yet")
+    // The clock never gets to withhold the first request: a machine whose date is wrong
+    // would otherwise lock the app out of ever asking, with nothing to correct it.
+    expect(action(a, Date(timeIntervalSince1970: 0), rejected: nil), .send,
+           "an expiry in 1970 is still worth one request")
+
+    // The bug in #4: the message could only be cleared by a 200, and a 429 backoff is
+    // exactly the state in which no 200 can arrive. A different token in the keychain is
+    // Claude Code having refreshed the login, and that is knowable without a request.
+    expect(action(b, future, rejected: a), .sendAndClearAuth, "the keychain has been rewritten")
+    expect(action(b, nil, rejected: a), .sendAndClearAuth, "and without an expiry to read")
+
+    // Withholding takes both: the endpoint refused this exact token, and the token itself
+    // says it has expired.
+    expect(action(a, past, rejected: a), .skip, "refused, and expired")
+    // A 401 alone is not conclusive. It can be transient, and retrying every poll is how
+    // the app used to recover from a passing 403 on its own; parking on the first one would
+    // trade #4 for a worse version of itself.
+    expect(action(a, future, rejected: a), .send, "refused while it should still be valid")
+    expect(action(a, nil, rejected: a), .send, "refused, with no expiry to corroborate it")
+    expect(action(a, now, rejected: a), .send, "expiring exactly now has not expired yet")
+}
+
+suite("UsageModel.authMessage") {
+    let now = Date(timeIntervalSince1970: 1_785_800_000)
+    func message(_ expiresAt: Date?) -> String {
+        UsageModel.authMessage(expiresAt: expiresAt, now: now)
+    }
+    // The everyday case is not an expired session at all: the access token lapsed and only
+    // Claude Code rewrites it. "Session expired" sends the user looking for a login screen
+    // that is not the problem.
+    expect(message(now.addingTimeInterval(-12 * 60)),
+           "Waiting for Claude Code to refresh the login (token expired 12m ago).",
+           "lapsed token")
+    expect(message(now.addingTimeInterval(-3 * 3600 - 49 * 60)),
+           "Waiting for Claude Code to refresh the login (token expired 3h 49m ago).",
+           "lapsed hours ago")
+    // Refused while it should still have been valid is a different thing, and keeps the
+    // original wording: something really is wrong with the login.
+    let refusedButLive = "Session expired. Open Claude Code to refresh the login."
+    expect(message(now.addingTimeInterval(600)), refusedButLive, "refused before it expired")
+    expect(message(nil), refusedButLive, "no timestamp to reason from")
+    expect(message(now), refusedButLive, "expiring exactly now is not yet expired")
 }
 
 // MARK: - Login item

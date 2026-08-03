@@ -275,8 +275,26 @@ enum Fmt {
     /// "8h 44m", "12m", "now".
     static func countdown(to date: Date?, from now: Date) -> String {
         guard let date else { return "" }
-        let secs = Int(date.timeIntervalSince(now))
-        if secs <= 0 { return "now" }
+        // `< 1` rather than `<= 0`: the whole-second truncation this used to do before
+        // comparing is what makes the last fraction of a second read "now" and not "1m".
+        let secs = date.timeIntervalSince(now)
+        return secs < 1 ? "now" : duration(secs)
+    }
+
+    /// A span of time as "3d 4h", "8h 44m" or "12m". Shared by the reset countdowns and by
+    /// the "expired 12m ago" half of the auth message, which is why it is not folded back
+    /// into `countdown`: they disagree about what zero means. A countdown that has run out
+    /// says "now"; an age that rounds down to nothing still happened.
+    ///
+    /// Never "0m" for a span that happened, and `Int(_: Double)` is not handed anything it
+    /// can trap on. The seconds reaching here come from dates the API sent, and nothing
+    /// stops that endpoint from putting the year 90000 in a `resets_at` - `Int(1e30)` is a
+    /// crash, not a large number. Same rule as `clampPercent`, at the other end of the app.
+    /// A non-finite input is the one case that does read "0m", because it is not a span at
+    /// all: rounding it up to "1m" would state an age that was never measured.
+    static func duration(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite else { return "0m" }
+        let secs = Int(min(max(seconds, 0), 3.15e9))  // ~100 years
         let d = secs / 86_400, h = (secs % 86_400) / 3600, m = (secs % 3600) / 60
         if d > 0 { return "\(d)d \(h)h" }
         if h > 0 { return "\(h)h \(m)m" }
