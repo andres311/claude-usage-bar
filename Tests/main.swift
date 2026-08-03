@@ -135,6 +135,73 @@ suite("AgentsMonitor.hostName") {
            "space in the executable path")
 }
 
+suite("AgentsMonitor: the Claude desktop app") {
+    let vmHost = "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/"
+        + "com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/"
+        + "com.apple.Virtualization.VirtualMachine"
+
+    // A desktop session runs in a guest, so nothing about the host process names Claude:
+    // the executable is Apple's, argv is bare and the ordinary rules must not match it.
+    expectTrue(AgentsMonitor.isVirtualizationHost(vmHost), "the VM host process")
+    expect(AgentsMonitor.isAgent(execPath: vmHost, argv: [vmHost]), false,
+           "and it is not an agent by the `claude` rules")
+    expect(AgentsMonitor.isVirtualizationHost("/Users/x/.local/bin/claude"), false, "a CLI is not a VM")
+    expect(AgentsMonitor.isVirtualizationHost("/Applications/UTM.app/Contents/MacOS/UTM"),
+           false, "another virtualizer's own binary")
+    expect(AgentsMonitor.isVirtualizationHost(""), false, "no executable")
+
+    // Which is why matching the executable settles nothing: every Virtualization.framework
+    // client on the machine runs that same system binary. The guest disk image is what
+    // separates Claude's VM from Docker's.
+    let bundle = "/Users/x/Library/Application Support/Claude/vm_bundles/claudevm.bundle"
+    expectTrue(AgentsMonitor.namesClaudeVMBundle(bundle + "/rootfs.img"), "the guest root disk")
+    expectTrue(AgentsMonitor.namesClaudeVMBundle(bundle + "/sessiondata.img"), "the session disk")
+    expectTrue(AgentsMonitor.namesClaudeVMBundle(bundle + "/efivars.fd"), "the firmware vars")
+    // Sandboxed, the same directory moves into the app's container. Matching a substring
+    // rather than an absolute path is what survives that.
+    expectTrue(AgentsMonitor.namesClaudeVMBundle(
+        "/Users/x/Library/Containers/com.anthropic.claudefordesktop/Data/Library/"
+        + "Application Support/Claude/vm_bundles/claudevm.bundle/rootfs.img"),
+        "the sandboxed container path")
+    // Near misses: another app's VM, and a file that merely sits under the app's support
+    // directory, which every Electron cache does.
+    expect(AgentsMonitor.namesClaudeVMBundle(
+        "/Users/x/Library/Application Support/OtherVM/vm_bundles/disk.img"), false,
+        "another app's guest disk")
+    expect(AgentsMonitor.namesClaudeVMBundle(
+        "/Users/x/Library/Application Support/Claude/Cache/data_0"), false,
+        "an ordinary file of the desktop app")
+    expect(AgentsMonitor.namesClaudeVMBundle("/Users/x/vm_bundles/claudevm.bundle/rootfs.img"),
+           false, "a bundle outside the app's support directory")
+
+    // The app's *other* local mode is not a VM at all, and needs none of this: its binary
+    // is called `claude`, so the ordinary rule already finds it.
+    expectTrue(AgentsMonitor.isAgent(
+        execPath: "/Users/x/Library/Application Support/Claude/claude-code/2.1.219/"
+            + "claude.app/Contents/MacOS/claude", argv: []),
+        "the desktop app's non-VM local binary is an ordinary session")
+
+    // What the row says. A guest has no host-side working directory, so "unknown folder"
+    // would be a wrong answer rather than a missing one.
+    func row(_ kind: AgentProcess.Kind, folder: String) -> AgentProcess {
+        AgentProcess(id: 1, folder: folder, host: "Terminal", elapsed: 60, uptime: "1m", kind: kind)
+    }
+    expect(row(.desktopVM, folder: "").label, "Desktop session", "a VM with no folder")
+    expect(row(.cli, folder: "").label, "unknown folder", "a CLI whose cwd could not be read")
+    expect(row(.cli, folder: "penmark").label, "penmark", "an ordinary session")
+    expect(row(.desktopVM, folder: "penmark").label, "penmark",
+           "a folder, if there ever is one, still wins")
+    expect(AgentProcess(id: 1, folder: "p", host: "Terminal", elapsed: 1, uptime: "0m").kind,
+           .cli, "the default kind is the ordinary one")
+
+    // It goes to the bottom of the list, like anything else without a folder, rather than
+    // interleaving with real directories.
+    let sorted = [row(.desktopVM, folder: ""),
+                  AgentProcess(id: 2, folder: "penmark", host: "VS Code", elapsed: 60, uptime: "1m")]
+        .sorted(by: AgentsMonitor.precedes)
+    expect(sorted.map(\.id), [2, 1], "the desktop session sorts last")
+}
+
 suite("AgentsMonitor.humanElapsed") {
     expect(AgentsMonitor.humanElapsed(192), "3m", "minutes")
     expect(AgentsMonitor.humanElapsed(7), "0m", "under a minute")
@@ -314,6 +381,42 @@ suite("AgentsMonitor.classify") {
 
     expect(AgentsMonitor.classify(previous: [], current: [], dt: 10,
                                   activeSince: [:], now: t0).agents.count, 0, "empty scan")
+
+    // A desktop session is a whole guest rather than a process, so it is measured against
+    // its own threshold. A list holds both kinds at once, and each row has to be judged by
+    // the rule that was measured for it.
+    func vm(_ id: Int32, cpu: Double, elapsed: TimeInterval = 3600) -> AgentProcess {
+        AgentProcess(id: id, folder: "", host: AgentsMonitor.desktopVMHost, elapsed: elapsed,
+                     uptime: "1h 0m", kind: .desktopVM, cpuNanos: UInt64(cpu),
+                     memoryBytes: 0, memoryText: "0 MB")
+    }
+    let vmSeed = vm(20, cpu: 0)
+    let vmIdle = vm(20, cpu: (AgentsMonitor.vmActiveThreshold - 0.001) * oneCore * 10,
+                    elapsed: 3610)
+    let vmBusy = vm(20, cpu: (AgentsMonitor.vmActiveThreshold + 0.001) * oneCore * 10,
+                    elapsed: 3610)
+    expect(AgentsMonitor.classify(previous: [vmSeed], current: [vmIdle], dt: 10,
+                                  activeSince: [:], now: t0).agents.first?.isActive,
+           false, "a guest ticking over below its threshold is idle")
+    expect(AgentsMonitor.classify(previous: [vmSeed], current: [vmBusy], dt: 10,
+                                  activeSince: [:], now: t0).agents.first?.isActive,
+           true, "and working above it")
+    // Both kinds in one scan, each against its own rule.
+    let mixed = AgentsMonitor.classify(previous: [idleSeed, vmSeed],
+                                       current: [burning(1, from: idleSeed, fraction: 0.5, dt: 10),
+                                                 vmIdle],
+                                       dt: 10, activeSince: [:], now: t0)
+    expect(mixed.agents.first(where: { $0.id == 1 })?.isActive, true, "the CLI is working")
+    expect(mixed.agents.first(where: { $0.id == 20 })?.isActive, false, "the guest is not")
+    // The hysteresis and the untrusted-window rules are shared, not per kind: a guest that
+    // spent the machine's sleep doing nothing must not light up on a lifetime average
+    // either. (This is the case that put 3 of 15 CLI sessions on screen; a VM that has been
+    // up for hours has an even longer average to be wrong about.)
+    let vmWorkedEarlier = vm(20, cpu: 1800 * oneCore, elapsed: 3600)
+    let vmStillParked = vm(20, cpu: 1800 * oneCore, elapsed: 3600 + 7200)
+    expect(AgentsMonitor.classify(previous: [vmWorkedEarlier], current: [vmStillParked],
+                                  dt: 7200, activeSince: [:], now: t0).agents.first?.isActive,
+           false, "an untrusted window concludes nothing for a guest either")
 }
 
 suite("AgentsMonitor.totalMemory") {

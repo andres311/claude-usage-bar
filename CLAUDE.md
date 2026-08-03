@@ -32,7 +32,7 @@ would not move (writes land in `Contents/`) and every `make` would rebuild. `Res
 is a prerequisite too, otherwise swapping the menu bar mark never triggers a rebuild.
 
 `make test` is the one exception: it compiles **every source but `App.swift`** with
-`Tests/main.swift` into a command line binary and runs it (268 checks, about a second).
+`Tests/main.swift` into a command line binary and runs it (292 checks, about a second).
 `App.swift` is left out because its `@main` cannot coexist with top-level code, and what
 it holds is `NSStatusItem`/`NSPopover` wiring that means nothing without a running app.
 There is no XCTest: the harness is twenty lines at the top of `Tests/main.swift`, and because
@@ -40,8 +40,9 @@ it is top-level code the file has to be called `main.swift` and cannot be compil
 `-parse-as-library`.
 
 What is covered: the process-table rules (`isAgent`, `hostName`, `precedes`,
-`sameOnScreen`, `humanElapsed`), the activity classifier (`classify`, including what a
-window it cannot trust may and may not conclude), severity, `Fmt`, the derived rows and
+`sameOnScreen`, `humanElapsed`), the desktop app's VM (`isVirtualizationHost`,
+`namesClaudeVMBundle`, `AgentProcess.label`), the activity classifier (`classify`, including
+what a window it cannot trust may and may not conclude, and both thresholds), severity, `Fmt`, the derived rows and
 gauges, **how the decoder degrades** when the response changes shape, the menu bar chips
 (`UsageModel.segments`), the whole 429 policy (`retryAfterSeconds`, `throttleDelay`,
 `pollDelay`, `fetchAllowedAt`), `StatusIcon.statusImage`'s template rule and accessibility
@@ -239,8 +240,10 @@ so nobody reads them as a state the app can be in.
 - `AgentsMonitor.swift` - counts processes whose executable *is* the `claude` binary, or
   whose script argument is when a known interpreter (`node`, `bun`, …) ran them, so an npm
   install (`node /…/bin/claude`) counts and `vim claude` does not. It deliberately matches
-  the CLI, the IDE extension binary and SDK runs, and excludes the Claude desktop app
-  (`Claude`, capital C) and this app itself.
+  the CLI, the IDE extension binary and SDK runs, and excludes the Claude desktop app's
+  Electron shell (`Claude`, capital C) and this app itself. Sessions started *from* the
+  desktop app are matched by a separate rule, since they are not processes on this machine
+  at all: see the VM entry below.
   - **It walks the process table through `libproc`, and must not go back to a
     subprocess.** It used to shell out to `ps -Ao` and one `lsof` per pid, and that was
     the app's entire CPU cost: forking `ps` makes the kernel format every process on the
@@ -284,6 +287,38 @@ so nobody reads them as a state the app can be in.
     entry like any other. Only the executable (a path by definition, spaces included) and
     arguments that *look* like a path - a slash and no whitespace - are searched now, which
     is what separates a location on disk from prose.
+  - **A session started from the Claude desktop app is not a process on this machine.** The
+    app boots a guest through `Virtualization.framework` and runs the CLI inside it, so
+    `proc_listallpids` never sees a `claude` process for it: the only host-visible thing is
+    Apple's own `com.apple.Virtualization.VirtualMachine`. That was the whole of issue #5,
+    and it is not the `Claude`-with-a-capital-C exclusion, which only ever covered the
+    Electron shell. Note the app's *other*, non-VM local mode needs none of this: its binary
+    is `…/claude-code/<version>/claude.app/Contents/MacOS/claude`, which `namesClaude`
+    already matches, so only the VM mode was ever invisible.
+    - **Matching the executable settles nothing**: UTM, Docker and every other
+      `Virtualization.framework` client runs that same system binary. And the process
+      carries nothing else - bare argv, `ppid` 1, `cwd` `/`. What identifies it is the
+      guest disk image it holds open (`vm_bundles/claudevm.bundle/rootfs.img`), read with
+      `PROC_PIDLISTFDS` + `PROC_PIDFDVNODEPATHINFO`.
+    - **That is the fd walk this file rejected once** (the `api.anthropic.com` socket idea
+      below), and the reason it is affordable now is the caller, not the syscall: that
+      version ran per agent on every scan, this one runs only for a process already known to
+      be Apple's VM host, of which a machine has zero or one. Measured at **14 µs** (p90 16,
+      max 19 over 200 runs) on a live VM with 13 descriptors, 9 of them vnodes. The full
+      scan measured 5.8 ms with or without it. Do not generalise it back to every pid.
+    - The marker is matched as a **substring**, not against an absolute path, so it still
+      works if the app is ever sandboxed and the directory moves under
+      `~/Library/Containers/<id>/Data/`.
+    - It is reported as **one row**, `folder: ""` and `host: "Claude app"`, which
+      `AgentProcess.label` prints as "Desktop session". "unknown folder" would be a wrong
+      answer rather than a missing one: the working directory is real, it is just inside the
+      guest. One VM hosts an unknown number of conversations and there is no way to split
+      it. The uuid directories under
+      `~/Library/Application Support/Claude/claude-code-sessions/` are **not** a way:
+      they are on-disk history and outlive the session that wrote them, so counting them
+      over-reports. Not read, deliberately.
+    - Quitting the app takes the VM with it, so the row disappears on the next scan with no
+      extra gating anywhere.
   - `allPids` retries when the read exactly fills its buffer: that may have been truncated,
     and a truncated table silently under-counts agents. After three tries it answers `nil`
     ("could not read"), never a short list.
@@ -316,6 +351,14 @@ so nobody reads them as a state the app can be in.
       every single sample above 1%. The gap between 1.1% and 2.6% is where 2% sits. Idle is
       **not** zero, so a threshold near zero would call everything active: even parked at
       the prompt these processes burn about half a percent of a core forever.
+    - **The desktop app's VM gets its own threshold** (`vmActiveThreshold`, picked per row by
+      `activeThreshold(for:)`), because it is not the same quantity being measured: the
+      number covers a whole guest OS, its kernel timers and the VM's device emulation, none
+      of which stop when nobody is typing. Sampled over 10s windows on a live idle guest
+      (n=44) it sits at **0.40-0.90% of a core, median 0.80%** - a tighter band than the
+      CLI's own idle, and comfortably under 2%, which is where the constant is. It landing on
+      the same figure as `activeThreshold` is a result, not a reason to share one constant:
+      the two move independently the next time either is re-measured.
     - `classify` lives outside `scan()`, is `nonisolated static` and takes the previous
       sample, the current one, `dt` and the hysteresis map as parameters. That is the
       main-actor line again: `AgentsMonitor` stays a stateless enum, `UsageModel` holds the
@@ -357,7 +400,9 @@ so nobody reads them as a state the app can be in.
       sits in `SSLEEP` exactly like one waiting on its first token, and zombies are already
       filtered because `KERN_PROCARGS2` fails on them); **open sockets to api.anthropic.com**
       via `PROC_PIDLISTFDS` (dozens of syscalls per agent, and keep-alive holds the
-      connection open whether or not a token is being spent); **the mtime of
+      connection open whether or not a token is being spent - note this is the same syscall
+      the desktop VM check uses, and what makes that one affordable is that it runs for at
+      most one process rather than for every agent); **the mtime of
       `~/.claude/projects/<slug>/<session>.jsonl`** (written when a message completes, so it
       reads stale through exactly the long stream it should be reporting, and mapping pid to
       session is guesswork when a folder holds several); and **`ri_virtual_size`** (420 GB
@@ -438,6 +483,8 @@ so nobody reads them as a state the app can be in.
     the rounding happens before the unit is chosen so nothing ever reads "1024 MB". It
     takes a `locale` like `money` and for the same reason: half the world writes "1,9 GB".
 - `UsageView.swift` - the SwiftUI panel (bars, agents list, gear menu, login item). The
+  folder column draws `AgentProcess.label`, not `folder`, so a desktop session reads
+  "Desktop session" instead of "unknown folder" (see the VM entry above). The
   pid is drawn with `Text(verbatim:)`: it is an identifier, and the interpolating
   initializer is free to format it as a number. `BarRow`, `UpdatedLabel` and
   `RefreshButton` are the only views that observe the `Clock`, and that is load-bearing
