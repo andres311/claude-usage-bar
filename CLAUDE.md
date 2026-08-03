@@ -32,7 +32,7 @@ would not move (writes land in `Contents/`) and every `make` would rebuild. `Res
 is a prerequisite too, otherwise swapping the menu bar mark never triggers a rebuild.
 
 `make test` is the one exception: it compiles **every source but `App.swift`** with
-`Tests/main.swift` into a command line binary and runs it (268 checks, about a second).
+`Tests/main.swift` into a command line binary and runs it (307 checks, about a second).
 `App.swift` is left out because its `@main` cannot coexist with top-level code, and what
 it holds is `NSStatusItem`/`NSPopover` wiring that means nothing without a running app.
 There is no XCTest: the harness is twenty lines at the top of `Tests/main.swift`, and because
@@ -44,8 +44,9 @@ What is covered: the process-table rules (`isAgent`, `hostName`, `precedes`,
 window it cannot trust may and may not conclude), severity, `Fmt`, the derived rows and
 gauges, **how the decoder degrades** when the response changes shape, the menu bar chips
 (`UsageModel.segments`), the whole 429 policy (`retryAfterSeconds`, `throttleDelay`,
-`pollDelay`, `fetchAllowedAt`), `StatusIcon.statusImage`'s template rule and accessibility
-description, `Credentials.parse` and `LoginItem.isInstalled`.
+`pollDelay`, `fetchAllowedAt`), the auth policy (`tokenAction`, `authMessage`, the token
+fingerprint), `StatusIcon.statusImage`'s template rule and accessibility description,
+`Credentials.parse` with its expiry field and `LoginItem.isInstalled`.
 
 **The dividing line is the main actor and the outside world.** Everything above is
 reachable as a plain function taking its inputs; what is left untested needs a live
@@ -55,7 +56,9 @@ delegate to them, so a test never builds a model, touches `UserDefaults` or hops
 main actor. Keep new logic on that side of the line: `Credentials.parse` and
 `LoginItem.isInstalled(bundlePath:home:)` are internal rather than private for exactly
 that reason, and `AgentsMonitor.isAgent`/`hostName` take the executable and argv as
-parameters instead of reading them from a pid.
+parameters instead of reading them from a pid. `UsageModel.tokenAction` and `authMessage`
+are the newest members of that set: what to do about a refused login is decided by plain
+functions over their inputs, so the whole policy runs without a keychain or a request.
 
 Add a case whenever you touch any of it. AppKit is imported by the harness but never
 started: `StatusIcon` only measures text and draws into an `NSImage`, neither of which
@@ -184,19 +187,50 @@ so nobody reads them as a state the app can be in.
     `DateFormatter` per call rather than caching one, since a cached one would be either
     isolated state reached from a non-isolated context or a mutable global; it is only
     reachable from a 429, which arrives minutes apart at most.
-  - `authExpired` is set by a 401/403 and cleared **only** by a 200. The 429 branch clears
-    `errorText`, and without that flag a rate limit landing after an expired token wiped
-    the "Session expired" message and with it the `!` chip - the only thing on the menu bar
-    saying the numbers had stopped being true. **The `catch` branch honors it too**, for
-    exactly the same reason: a network blip while the token is expired must not replace that
-    message with "The Internet connection appears to be offline."
+  - **`authRejected` holds a fingerprint of the token that got the 401, and being non-nil
+    *is* the expired state** (`authExpired` is a computed read of it). The 429 branch and the
+    `catch` branch both clear `errorText` only when it is nil: a rate limit or a network blip
+    landing after an expired token must not wipe the "Session expired" message and with it
+    the `!` chip, the only thing on the menu bar saying the numbers stopped being true.
+    - It used to be a `Bool` cleared **only** by a 200, and that was issue #4. The 200 that
+      would clear it *cannot arrive while a backoff is running*, so the panel kept insisting
+      the session had expired for up to 8 minutes after Claude Code had already written a
+      good token into the keychain. A fingerprint answers the question a boolean could not -
+      "is this still the token that was refused?" - without spending a request to find out.
+    - The fingerprint is 16 hex digits of SHA-256 and **never the token**: that is the one
+      secret this app handles and it has no business in a property that outlives the request
+      it was read for. One property rather than a flag beside it, so there are not two values
+      set and cleared on the same three branches that can drift apart.
+  - **`tokenAction` decides whether a token is worth a request, and withholding one takes
+    two independent pieces of evidence.** `.sendAndClearAuth` when the keychain holds a
+    different token (Claude Code refreshed it; the message comes down *before* the request
+    rather than after a 200 that a backoff may be holding off). `.skip` only when the token
+    is byte-identical to the one already refused **and** its own `expiresAt` is in the past.
+    `.send` otherwise.
+    - Either half alone is a way to get stuck, in opposite directions. A 401 alone can be
+      transient - retrying every poll is how the app used to recover from a passing 403 by
+      itself, and parking on the first one trades #4 for a worse version of itself. The
+      clock alone is never consulted before the first request either: declining to ask
+      because *this machine* thinks a token expired lets a skewed clock lock the app out of
+      ever asking, with nothing to correct it.
+    - Together they are conclusive: the server refused this exact token, it cannot start
+      working on its own, and its replacement arrives through the keychain where
+      `.sendAndClearAuth` sees it without a request being spent on the wait.
+  - **`authMessage` distinguishes two situations wearing one status code.** The everyday one
+    is not an expired session at all: the access token lasts hours, only Claude Code rewrites
+    it, and a stretch of not using `claude` is enough to get a 401 on a perfectly good login.
+    "Session expired" sends the user looking for a login screen that is not the problem, so
+    that case reads "Waiting for Claude Code to refresh the login (token expired 12m ago)"
+    and the original wording is kept for a token refused while it should still be valid. The
+    `.skip` branch re-states the message every poll so the age keeps counting up instead of
+    freezing at whatever it said when the 401 landed.
   - `clearThrottle()` (`throttledUntil = nil`, `consecutive429 = 0`) runs on **every branch
     that got an HTTP status other than 429** - the 200, the 401/403 and the `default` - and
     deliberately not from `catch`. Receiving any status at all is proof the endpoint has
     stopped refusing us, so the doubling has to start over; a 401 arriving after two 429s
     used to leave the counter at 2 and the next blip started at 4 minutes instead of one.
     A failed request proves nothing either way, so it leaves the backoff untouched.
-    In the 200 branch it runs **before** the decode, alongside `authExpired = false`: what
+    In the 200 branch it runs **before** the decode, alongside `authRejected = nil`: what
     both react to is the status line, and a `throw` from the decoder used to skip them and
     leave the app on an 8 minute backoff still showing "Session expired" while the endpoint
     was answering it perfectly well.
@@ -420,6 +454,14 @@ so nobody reads them as a state the app can be in.
     It reads as "this is the limit currently binding". Filtering on it collapsed the
     whole panel down to a single bar. Limits an account does not have are simply absent
     from the array, so every entry gets a row.
+  - `Fmt.countdown` is a thin shell over `Fmt.duration`, which is the same arithmetic
+    without the zero case: a countdown that has run out says "now", but an age ("token
+    expired 12m ago") that rounds down to nothing still happened, so `duration` never
+    prints "0m". `countdown` tests `< 1` rather than `<= 0` because the whole-second
+    truncation it used to do before comparing is what makes the last fraction of a second
+    read "now" and not "1m". `duration` guards `isFinite` and clamps before `Int(_:)` for
+    the usual reason: these spans come off dates the API sent, and `Int(1e30)` is a crash
+    rather than a large number.
   - `Fmt.money` and `creditsRow` take a `locale` (defaulting to `.current`). The app always
     passes the default and *should* render "US$ 64,20" for a reader in Argentina; the
     parameter exists so `Tests/main.swift` can pin `en_US` instead of asserting against
@@ -508,6 +550,24 @@ falling back to `~/.claude/.credentials.json`; `claudeAiOauth.accessToken` is us
 never persisted or logged. On 401/403 the app does not attempt the OAuth refresh flow: it
 tells the user to open Claude Code, which rewrites the keychain item, and the next poll
 picks it up.
+
+**The access token lapses on its own (~8h measured) and only Claude Code renews it**, when
+*it* next makes a request. So a 401 on a machine that is fully logged in is the everyday
+case, not the exceptional one, and the app has to treat it as a wait rather than as a
+logout. `Credentials.parse` therefore reads `claudeAiOauth.expiresAt` beside the token, and
+`UsageModel` keeps a fingerprint of whatever got refused. See the `authRejected`,
+`tokenAction` and `authMessage` notes under `UsageModel.swift`.
+
+`expiresAt` is milliseconds since the epoch, and `Credentials.expiry` trusts nothing about
+it: non-finite is dropped (the NaN trap again), and so is anything below `1e12`, which in
+practice is a *seconds* timestamp landing in a milliseconds field - 2026 read as seconds is
+January 1970, and the panel would announce a login that expired 56 years ago. The unit is
+deliberately not inferred from the magnitude, since guessing wrong is off by 1000 the other
+way. No usable timestamp simply falls back to the shorter message.
+
+The other keychain items matching `Claude Code-credentials-<hash>` hold MCP OAuth state,
+not the login. `find-generic-password -s` is an exact match on the service, so they are
+never picked up by accident.
 
 ## Gotchas
 

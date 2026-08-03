@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -120,10 +121,24 @@ final class UsageModel: ObservableObject {
     private var lastAttempt: Date?
     /// Consecutive 429s, for the doubling backoff below. Reset by any 200.
     private var consecutive429 = 0
-    /// Set by a 401/403 and cleared only by a 200. A 429 must not wipe the "session
-    /// expired" message off the panel: the token is still expired, and losing the text
-    /// also loses the `!` chip, which is the only thing saying the numbers are stale.
-    private var authExpired = false
+    /// Fingerprint of the token the endpoint answered 401/403 for, and by being non-nil,
+    /// the "session expired" state itself. Set by a 401/403, cleared by a 200 **or** by the
+    /// keychain coming back with a different token.
+    ///
+    /// A 429 must not clear it: the token is still rejected, and losing the message also
+    /// loses the `!` chip, the only thing on the menu bar saying the numbers are stale. But
+    /// a boolean cleared *only* by a 200 was the bug in #4, because the 200 that would clear
+    /// it cannot happen while a backoff is running: the panel kept insisting the session had
+    /// expired for up to eight minutes after Claude Code had already written a good token.
+    /// A fingerprint answers the question the boolean could not - "is this still the token
+    /// that was refused?" - without spending a request to find out.
+    ///
+    /// It holds a fingerprint and never the token: that is the one secret this app handles,
+    /// and it has no business in a property outliving the request it was read for. And it
+    /// replaces the old flag rather than sitting beside it, so there are not two properties
+    /// set and cleared on the same three branches, waiting to disagree.
+    private var authRejected: String?
+    private var authExpired: Bool { authRejected != nil }
     /// How often the process table is scanned. This is a local `libproc` walk, so it is
     /// rate limited by nothing and has no business sharing a cadence with the API: it runs
     /// in its own loop precisely so a 15 minute usage interval cannot leave a session that
@@ -219,6 +234,74 @@ final class UsageModel: ObservableObject {
     /// a running backoff, whichever is later.
     nonisolated static func fetchAllowedAt(lastAttempt: Date?, throttledUntil: Date?) -> Date? {
         [lastAttempt?.addingTimeInterval(minFetchGap), throttledUntil].compactMap { $0 }.max()
+    }
+
+    // MARK: - Auth policy
+    //
+    // Same shape as the backoff arithmetic above and for the same reason: what to do about
+    // a login the endpoint refused is decided by plain functions over their inputs, so the
+    // whole policy is exercised from `Tests/main.swift` without a keychain or a request.
+
+    /// What to do with the token just read out of the keychain.
+    enum TokenAction: Equatable {
+        /// Send the request.
+        case send
+        /// Send it, and take the "session expired" message down first. This is not the
+        /// token the endpoint refused, so nothing it said about the old one is still known
+        /// to be true - and waiting for a 200 to prove that is what kept the message up
+        /// through an eight minute backoff (#4).
+        case sendAndClearAuth
+        /// Do not send. The endpoint has already answered 401 for this exact token *and*
+        /// the token says it has expired, so the request can only come back 401 again while
+        /// spending budget against a 5-minute rate-limit window this app goes to some
+        /// length to stay out of.
+        case skip
+    }
+
+    /// Whether a token is worth a request.
+    ///
+    /// **Withholding one takes two independent pieces of evidence**: a 401 the endpoint
+    /// answered for this exact token, and the token's own declared expiry being in the
+    /// past. Either alone is a way to get stuck.
+    ///
+    /// - A 401 alone is not enough, because it can be transient. Before this function the
+    ///   app simply retried every poll and recovered from a passing 403 on its own; parking
+    ///   on the first one would trade issue #4 for a worse version of itself.
+    /// - The clock alone is not enough, and is never consulted before the first request.
+    ///   Deciding not to ask because *this machine* thinks a token has expired means a
+    ///   skewed clock can lock the app out of ever asking, with nothing to correct it.
+    ///
+    /// Together they are conclusive: a token the server refused, which will not start
+    /// working on its own, and whose replacement will arrive through the keychain and be
+    /// recognised by `.sendAndClearAuth` without a request being spent on the wait.
+    nonisolated static func tokenAction(fingerprint: String,
+                                        expiresAt: Date?,
+                                        rejected: String?,
+                                        now: Date) -> TokenAction {
+        guard let rejected else { return .send }
+        guard fingerprint == rejected else { return .sendAndClearAuth }
+        guard let expiresAt, expiresAt < now else { return .send }
+        return .skip
+    }
+
+    /// The panel's line for a login the endpoint refused, which is two situations wearing
+    /// one status code.
+    ///
+    /// The everyday one is not an expired *session* at all: Claude Code's access token
+    /// lasts hours, only Claude Code rewrites it, and it does so when it next makes a
+    /// request. A stretch of not using `claude` is enough to get a 401 while the login is
+    /// perfectly good, and "Session expired" then sends the user looking for a login screen
+    /// that is not the problem. Naming the wait, with how long it has been going on, says
+    /// both what happened and that it clears itself.
+    ///
+    /// The other one - refused while the token should still be valid - keeps the original
+    /// wording, because then something really is wrong with the login.
+    nonisolated static func authMessage(expiresAt: Date?, now: Date) -> String {
+        guard let expiresAt, expiresAt < now else {
+            return "Session expired. Open Claude Code to refresh the login."
+        }
+        let ago = Fmt.duration(now.timeIntervalSince(expiresAt))
+        return "Waiting for Claude Code to refresh the login (token expired \(ago) ago)."
     }
 
     /// What a fresh install polls at, before anyone touches the gear menu.
@@ -428,15 +511,31 @@ final class UsageModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
-        guard let token = await Credentials.accessToken() else {
+        guard let token = await Credentials.token() else {
             errorText = "No Claude Code credentials found. Run `claude` and log in."
+            return
+        }
+
+        // A login the endpoint refused stays refused until something about it changes, and
+        // the keychain is the only place that change can show up. See `tokenAction`.
+        switch Self.tokenAction(fingerprint: token.fingerprint, expiresAt: token.expiresAt,
+                                rejected: authRejected, now: Date()) {
+        case .send:
+            break
+        case .sendAndClearAuth:
+            authRejected = nil
+            errorText = nil
+        case .skip:
+            // Re-stated rather than left alone so the "expired 12m ago" keeps counting up
+            // instead of freezing at whatever it said when the 401 landed.
+            errorText = Self.authMessage(expiresAt: token.expiresAt, now: Date())
             return
         }
 
         var req = URLRequest(url: Self.usageURL)
         req.httpMethod = "GET"
         req.timeoutInterval = 15
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(token.value)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -452,7 +551,7 @@ final class UsageModel: ObservableObject {
                 // afterwards they were skipped by a `throw` from the decoder, which left
                 // the app on an 8 minute backoff and showing "Session expired" while the
                 // endpoint was answering it perfectly well.
-                authExpired = false
+                authRejected = nil
                 clearThrottle()
                 usage = try JSONDecoder().decode(UsageResponse.self, from: data)
                 lastUpdated = Date()
@@ -460,9 +559,11 @@ final class UsageModel: ObservableObject {
                 UserDefaults.standard.set(data, forKey: Keys.cachedUsage)
                 UserDefaults.standard.set(lastUpdated, forKey: Keys.cachedAt)
             case 401, 403:
-                // Claude Code refreshes the token itself; we just wait for it.
-                authExpired = true
-                errorText = "Session expired. Open Claude Code to refresh the login."
+                // Claude Code refreshes the token itself; we wait for it to write a new one
+                // into the keychain and recognise it by its fingerprint, rather than by
+                // re-sending this one every poll until something happens to answer 200.
+                authRejected = token.fingerprint
+                errorText = Self.authMessage(expiresAt: token.expiresAt, now: Date())
                 clearThrottle()
             case 429:
                 // Back off and keep showing the last known numbers.
@@ -598,9 +699,32 @@ final class UsageModel: ObservableObject {
 enum Credentials {
     private static let keychainService = "Claude Code-credentials"
 
+    /// The OAuth access token, plus the two things the app needs to reason about it
+    /// without ever putting the secret anywhere it does not have to be.
+    struct Token: Sendable {
+        let value: String
+        /// When the token stops being accepted, if the blob carries a usable timestamp.
+        /// Optional because this file is written by another program and is undocumented:
+        /// a renamed or missing field costs the wording of one message, never a request.
+        let expiresAt: Date?
+
+        /// A stable identity for the secret that is not the secret: the first 16 hex digits
+        /// of its SHA-256. It answers exactly one question - "is this the same token that
+        /// was refused?" - which is all `UsageModel.tokenAction` needs, and it is the only
+        /// form of the token the model is willing to hold on to between requests. 64 bits
+        /// is far past enough to tell two tokens apart; this is not a security boundary,
+        /// and the full digest of a secret is still a thing worth not keeping around.
+        var fingerprint: String {
+            SHA256.hash(data: Data(value.utf8))
+                .prefix(8)
+                .map { String(format: "%02x", $0) }
+                .joined()
+        }
+    }
+
     /// Reads the OAuth access token off the main thread.
-    static func accessToken() async -> String? {
-        await Task.detached(priority: .utility) { () -> String? in
+    static func token() async -> Token? {
+        await Task.detached(priority: .utility) { () -> Token? in
             if let json = readKeychain(), let token = parse(json) { return token }
             let file = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude/.credentials.json")
@@ -626,17 +750,37 @@ enum Credentials {
         return p.terminationStatus == 0 ? data : nil
     }
 
-    /// Pulls `claudeAiOauth.accessToken` out of the credentials blob. Internal rather than
-    /// private so the tests can cover the shapes that must yield nothing: the token is the
-    /// one secret this app touches, and an empty or malformed one has to read as "no
-    /// credentials" rather than as a `Bearer ` header with nothing behind it.
-    static func parse(_ data: Data) -> String? {
+    /// Pulls `claudeAiOauth` out of the credentials blob. Internal rather than private so
+    /// the tests can cover the shapes that must yield nothing: the token is the one secret
+    /// this app touches, and an empty or malformed one has to read as "no credentials"
+    /// rather than as a `Bearer ` header with nothing behind it.
+    ///
+    /// Only `accessToken` can fail the whole parse. `expiresAt` is read beside it and
+    /// degrades on its own, the same rule the usage decoder follows field by field: losing
+    /// it costs the difference between two messages, and there is no version of that worth
+    /// answering "no credentials found" over.
+    static func parse(_ data: Data) -> Token? {
         guard
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let oauth = root["claudeAiOauth"] as? [String: Any],
             let token = oauth["accessToken"] as? String,
             !token.isEmpty
         else { return nil }
-        return token
+        return Token(value: token, expiresAt: expiry(oauth["expiresAt"]))
+    }
+
+    /// `claudeAiOauth.expiresAt`: milliseconds since the epoch, as Claude Code writes it.
+    ///
+    /// Nothing about the value is trusted. A non-finite one is dropped rather than turned
+    /// into a `Date` every comparison is false against - the NaN trap this app has already
+    /// met twice, in `throttleDelay` and `clampPercent`. So is anything below the year 2001
+    /// (`1e12` ms), which in practice means a *seconds* timestamp landing in a field
+    /// documented in milliseconds: 2026 read as seconds is January 1970, so the panel would
+    /// announce a login that expired 56 years ago. The unit is deliberately not guessed
+    /// from the magnitude either, since guessing wrong is off by a factor of 1000 in the
+    /// other direction. No timestamp is no advice, and the message has a wording for that.
+    static func expiry(_ raw: Any?) -> Date? {
+        guard let ms = raw as? Double, ms.isFinite, ms >= 1e12 else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
     }
 }
