@@ -354,11 +354,24 @@ so nobody reads them as a state the app can be in.
     - **The desktop app's VM gets its own threshold** (`vmActiveThreshold`, picked per row by
       `activeThreshold(for:)`), because it is not the same quantity being measured: the
       number covers a whole guest OS, its kernel timers and the VM's device emulation, none
-      of which stop when nobody is typing. Sampled over 10s windows on a live idle guest
-      (n=44) it sits at **0.40-0.90% of a core, median 0.80%** - a tighter band than the
-      CLI's own idle, and comfortably under 2%, which is where the constant is. It landing on
-      the same figure as `activeThreshold` is a result, not a reason to share one constant:
-      the two move independently the next time either is re-measured.
+      of which stop when nobody is typing. It landing on the same figure as
+      `activeThreshold` is a result, not a reason to share one constant: the two move
+      independently the next time either is re-measured.
+      - **Idle, measured over 10s windows on a live guest, n=128**: median **0.80% of a
+        core**, p95 0.90%, p99 1.00%. Tighter than the CLI's own idle band, and 2% clears it
+        by the same margin the CLI's 2% clears its 1.08% worst case.
+      - **One sample of the 128 reached 4.1%**, and that is a known cost rather than an
+        oversight: a single spike puts the row on "working" for the 45s the hysteresis holds,
+        about once per twenty minutes of an idle guest. Raising the threshold past it was
+        rejected, because the failure on the other side is worse - a desktop session that
+        really is working reading idle is the feature not working, while a rare 45s of
+        "working" on an idle one is a cosmetic wrong.
+      - **The busy half is not measured yet.** Everything above is an idle guest; a desktop
+        session doing real work was never captured, so the *floor* a working guest sits at is
+        inferred rather than known (a `claude` process alone measured 2.6-4.1% when working,
+        and a guest adds its own overhead on top, so it should clear 2% comfortably). If that
+        turns out wrong the number moves, and it is the one thing here worth re-measuring
+        first. The sampler is fifteen lines of `ps -o time` deltas, exactly as for the CLI.
     - `classify` lives outside `scan()`, is `nonisolated static` and takes the previous
       sample, the current one, `dt` and the hysteresis map as parameters. That is the
       main-actor line again: `AgentsMonitor` stays a stateless enum, `UsageModel` holds the
