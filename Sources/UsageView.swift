@@ -233,7 +233,7 @@ private struct AgentRow: View {
                 .fill(agent.isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.quaternary))
                 .frame(width: 5, height: 5)
                 .accessibilityLabel(agent.isActive ? "working" : "idle")
-            Text(agent.folder.isEmpty ? "unknown folder" : agent.folder)
+            Text(agent.label)
                 .font(.caption)
                 .foregroundStyle(agent.isActive ? .primary : .secondary)
                 .lineLimit(1)

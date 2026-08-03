@@ -8,11 +8,22 @@ import Foundation
 /// what is printed, so a value that moves on every scan (`elapsed`, `memoryBytes`,
 /// `cpuNanos`) must not be what decides whether to publish. See `sameOnScreen`.
 struct AgentProcess: Identifiable, Equatable {
+    /// What kind of thing this row is. It exists because the two are not measured the same:
+    /// a guest OS burns CPU at idle where a CLI process does not, so `classify` picks the
+    /// activity threshold from this (see `AgentsMonitor.activeThreshold(for:)`).
+    enum Kind: String, Equatable {
+        /// A `claude` process running on this machine.
+        case cli
+        /// The Claude desktop app's guest, seen from the host as one VM process.
+        case desktopVM
+    }
+
     let id: Int32                // pid
     let folder: String           // working directory basename, "" if unknown
-    let host: String             // "VS Code", "Terminal", "Cursor", …
+    let host: String             // "VS Code", "Terminal", "Cursor", "Claude app", …
     let elapsed: TimeInterval    // seconds since it started, what the list sorts on
     let uptime: String           // the same thing as "8m" or "3h 12m"
+    let kind: Kind
     /// CPU consumed since the process started, in nanoseconds. Only ever meaningful as a
     /// difference between two scans: see `AgentsMonitor.classify`.
     let cpuNanos: UInt64
@@ -24,18 +35,34 @@ struct AgentProcess: Identifiable, Equatable {
     /// false; `classify` is what decides, because it needs two samples and a clock.
     var isActive: Bool
 
+    /// `kind` defaults to `.cli` because that is genuinely the neutral value: every process
+    /// found by walking for `claude` binaries is one, and the VM is the single exception
+    /// that has to say so. Compare `statusSegments`' `activeAgentCount`, which has no
+    /// default precisely because `0` there is a claim rather than an absence.
     init(id: Int32, folder: String, host: String, elapsed: TimeInterval, uptime: String,
-         cpuNanos: UInt64 = 0, memoryBytes: UInt64 = 0, memoryText: String = "",
-         isActive: Bool = false) {
+         kind: Kind = .cli, cpuNanos: UInt64 = 0, memoryBytes: UInt64 = 0,
+         memoryText: String = "", isActive: Bool = false) {
         self.id = id
         self.folder = folder
         self.host = host
         self.elapsed = elapsed
         self.uptime = uptime
+        self.kind = kind
         self.cpuNanos = cpuNanos
         self.memoryBytes = memoryBytes
         self.memoryText = memoryText
         self.isActive = isActive
+    }
+
+    /// What the panel prints where the folder goes.
+    ///
+    /// A desktop session has no host-side working directory to read: the folder it is
+    /// running in lives inside the guest, so "unknown folder" would be a wrong answer
+    /// rather than a missing one. It is not stored, because it is decided entirely by two
+    /// fields `sameOnScreen` already compares.
+    var label: String {
+        if !folder.isEmpty { return folder }
+        return kind == .desktopVM ? "Desktop session" : "unknown folder"
     }
 }
 
@@ -44,7 +71,12 @@ struct AgentProcess: Identifiable, Equatable {
 /// A process counts as an agent when its executable is the `claude` binary, or when a
 /// known interpreter runs it (`node /…/bin/claude`). That matches the native install,
 /// the IDE extension's bundled binary and SDK/npm runs, and excludes the Claude desktop
-/// app (`Claude`, capital C) and this menu bar app.
+/// app's Electron shell (`Claude`, capital C) and this menu bar app.
+///
+/// A session started *from* the desktop app is the one case that no rule about `claude`
+/// binaries can find, because there is no such process on the host: it runs inside a
+/// guest. It is matched separately, by the VM host process holding the app's guest disk
+/// image open. See "The desktop app" below.
 ///
 /// **Every question here is answered by a syscall, never by a subprocess, and it has to
 /// stay that way.** A scan costs **~3 ms** on a 750-process table. Asking `ps -Ao` the
@@ -75,20 +107,18 @@ enum AgentsMonitor {
                 // rather than guessed at: macOS will not hand a non-root user another
                 // user's arguments either, so there is nothing to identify them by.
                 guard let exec = execPath(pid) else { continue }
-                guard interpreters.contains(base(exec)) || namesClaude(exec) else { continue }
-
-                let argv = arguments(pid)
-                guard isAgent(execPath: exec, argv: argv) else { continue }
+                guard let what = identify(pid: pid, execPath: exec) else { continue }
 
                 let elapsed = max(0, now - (startTime(pid) ?? now))
                 // One more syscall, and it answers both remaining questions at once.
                 let usage = resourceUsage(pid)
                 agents.append(AgentProcess(
                     id: pid,
-                    folder: cwdName(of: pid),
-                    host: hostName(execPath: exec, argv: argv),
+                    folder: what.folder,
+                    host: what.host,
                     elapsed: elapsed,
                     uptime: humanElapsed(elapsed),
+                    kind: what.kind,
                     cpuNanos: usage?.cpuNanos ?? 0,
                     memoryBytes: usage?.memoryBytes ?? 0,
                     memoryText: Fmt.memory(usage?.memoryBytes ?? 0)
@@ -96,6 +126,27 @@ enum AgentsMonitor {
             }
             return agents.sorted(by: precedes)
         }.value
+    }
+
+    /// What a pid is, if it is anything at all: the two ways a Claude Code session shows up
+    /// on this machine, and `nil` for the rest of the table.
+    ///
+    /// Both branches are decided by the executable first, which is the syscall the caller
+    /// has already paid for, so nothing further is read for the ~99% that is neither. The
+    /// order matters only in that the VM check is a string compare against a path that can
+    /// never also be a `claude` binary.
+    private static func identify(pid: Int32, execPath exec: String)
+        -> (kind: AgentProcess.Kind, folder: String, host: String)? {
+        if isVirtualizationHost(exec) {
+            guard holdsClaudeVMBundle(pid) else { return nil }
+            // No folder: the working directory is inside the guest and the host process
+            // sits in `/`. Reading `cwdName` here would print "/" as a session's location.
+            return (.desktopVM, "", desktopVMHost)
+        }
+        guard interpreters.contains(base(exec)) || namesClaude(exec) else { return nil }
+        let argv = arguments(pid)
+        guard isAgent(execPath: exec, argv: argv) else { return nil }
+        return (.cli, cwdName(of: pid), hostName(execPath: exec, argv: argv))
     }
 
     /// Grouped by folder, then longest-running first within a folder, then by pid so the
@@ -125,6 +176,8 @@ enum AgentsMonitor {
     /// is stored next to its formatted form.
     ///
     /// `isActive` *is* compared: it is drawn, and it is the whole point of the feature.
+    /// `kind` is not, and does not need to be: it cannot change under a stable pid, and the
+    /// only thing drawn from it (`label`, when there is no folder) moves with `host` anyway.
     static func sameOnScreen(_ a: [AgentProcess], _ b: [AgentProcess]) -> Bool {
         a.count == b.count && zip(a, b).allSatisfy {
             $0.id == $1.id && $0.folder == $1.folder
@@ -155,6 +208,30 @@ enum AgentsMonitor {
     /// a core whether their TUI is visible or hidden, and a session doing work averages
     /// several percent over a scan interval. 2% sits in the gap.
     static let activeThreshold: Double = 0.02
+
+    /// The same rule for a desktop session, which is a whole guest OS rather than a process.
+    ///
+    /// It gets a constant of its own because what it measures is not the same quantity: the
+    /// number includes the guest's kernel, its timers and the VM's own device emulation, all
+    /// of which keep running with nobody typing. Landing on the same figure as
+    /// `activeThreshold` is a result, not a reason to share one constant.
+    ///
+    /// Measured over 10s windows on a live idle guest, n=128: median 0.80% of a core, p95
+    /// 0.90%, p99 1.00%. One sample of the 128 reached 4.1%, and that outlier is the known
+    /// cost of this number: a single spike marks the row working for the 45s the hysteresis
+    /// holds. It stays at 2% anyway, because raising it to clear an outlier trades a rare
+    /// false "working" for the failure that matters more - a session that really is working
+    /// reading idle. See CLAUDE.md for what is still unmeasured here.
+    static let vmActiveThreshold: Double = 0.02
+
+    /// Which threshold applies to a row. `classify` asks per agent rather than per scan,
+    /// since a list holds both kinds at once.
+    static func activeThreshold(for kind: AgentProcess.Kind) -> Double {
+        switch kind {
+        case .cli: return activeThreshold
+        case .desktopVM: return vmActiveThreshold
+        }
+    }
 
     /// How long a session stays marked active after its last burst above the threshold.
     ///
@@ -208,7 +285,7 @@ enum AgentsMonitor {
         for var agent in current {
             if let load = load(agent: agent, previous: before[agent.id],
                                dt: dt, windowUsable: usable),
-               load >= activeThreshold {
+               load >= activeThreshold(for: agent.kind) {
                 since[agent.id] = now
             }
             // Above the threshold this instant, or recently enough to still count.
@@ -297,6 +374,41 @@ enum AgentsMonitor {
 
     private static func base(_ path: String) -> String {
         (path as NSString).lastPathComponent
+    }
+
+    // MARK: The desktop app
+    //
+    // A session started from the Claude desktop app runs inside a guest, so there is no
+    // `claude` process on the host to find: `proc_listallpids` sees only Apple's VM host
+    // process, and the guest's is invisible from here. Everything the rules above look at
+    // is missing - the executable is Apple's, argv is bare, `ppid` is 1 and `cwd` is `/` -
+    // so the only thing tying that process to Claude is the guest disk image it holds open.
+    //
+    // The app's other, non-VM local mode is not this case and needs nothing: its binary is
+    // `…/claude-code/<version>/claude.app/Contents/MacOS/claude`, which `namesClaude`
+    // already matches.
+
+    /// The label the panel prints for a desktop session, in the column that says where a
+    /// session is driven from. It is the truthful answer to that question.
+    static let desktopVMHost = "Claude app"
+
+    /// Apple's generic VM host process.
+    ///
+    /// Matching this **is not** matching Claude: UTM, Docker and anything else built on
+    /// `Virtualization.framework` runs the very same binary out of the very same system
+    /// path. It only opens the question that `holdsClaudeVMBundle` answers.
+    static func isVirtualizationHost(_ execPath: String) -> Bool {
+        base(execPath) == "com.apple.Virtualization.VirtualMachine"
+    }
+
+    /// Whether an open file identifies a VM as the Claude desktop app's.
+    ///
+    /// The guest's disk images (`rootfs.img`, `sessiondata.img`, `efivars.fd`) live in the
+    /// app's own support directory, and holding one open is what no other VM does. Matched
+    /// as a substring rather than against an absolute path so it survives being sandboxed,
+    /// where the same directory sits under `~/Library/Containers/<id>/Data/`.
+    static func namesClaudeVMBundle(_ path: String) -> Bool {
+        path.contains("/Application Support/Claude/vm_bundles/")
     }
 
     /// Where the session is being driven from. The IDE cases are recognised by the
@@ -474,12 +586,55 @@ enum AgentsMonitor {
             proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, $0, size)
         }
         guard read == size else { return "" }
-        let path = withUnsafePointer(to: &info.pvi_cdir.vip_path) {
+        let path = vnodePath(&info.pvi_cdir.vip_path)
+        guard path != "/", !path.isEmpty else { return "" }
+        return (path as NSString).lastPathComponent
+    }
+
+    /// Whether a pid holds one of the Claude desktop app's guest disk images open.
+    ///
+    /// **This is the fd walk that was rejected once, and the reason it is affordable here
+    /// is the caller.** `PROC_PIDLISTFDS` was turned down for the "open sockets to
+    /// api.anthropic.com" activity signal because it ran per agent on every scan; this runs
+    /// only for a process whose executable is already Apple's VM host, of which a machine
+    /// has zero or one. Measured at **14 µs** (p90 16, max 19 over 200 runs) against a live
+    /// VM holding 13 descriptors of which 9 are vnodes, once every 10 or 30 seconds, and
+    /// *only* while a VM is running at all. The whole scan measured 5.8 ms either way.
+    ///
+    /// A short read costs a match rather than a wrong one, so unlike `allPids` it is not
+    /// retried: the next scan asks again ten seconds later.
+    private static func holdsClaudeVMBundle(_ pid: Int32) -> Bool {
+        let sized = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard sized > 0 else { return false }
+        let stride = MemoryLayout<proc_fdinfo>.stride
+        // Slack for descriptors opened between the sizing call and the read.
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(sized) / stride + 32)
+        let read = fds.withUnsafeMutableBufferPointer {
+            proc_pidinfo(pid, PROC_PIDLISTFDS, 0, $0.baseAddress, Int32($0.count * stride))
+        }
+        guard read > 0 else { return false }
+
+        for fd in fds.prefix(min(Int(read) / stride, fds.count))
+        where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+            var info = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            let got = withUnsafeMutablePointer(to: &info) {
+                proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, $0, size)
+            }
+            // A descriptor closed since the list was read simply fails; skip it.
+            guard got == size else { continue }
+            if namesClaudeVMBundle(vnodePath(&info.pvip.vip_path)) { return true }
+        }
+        return false
+    }
+
+    /// A `vnode_info_path`'s `vip_path`, which the kernel hands over as a fixed
+    /// `MAXPATHLEN` buffer of `CChar` and always terminates.
+    private static func vnodePath<Buffer>(_ raw: inout Buffer) -> String {
+        withUnsafePointer(to: &raw) {
             $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) {
                 String(cString: $0)
             }
         }
-        guard path != "/", !path.isEmpty else { return "" }
-        return (path as NSString).lastPathComponent
     }
 }
