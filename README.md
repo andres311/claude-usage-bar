@@ -42,6 +42,12 @@ gigabytes, and the memory a session holds does not drop when it goes idle.
 The memory column is the same number Activity Monitor shows in its "Memory" column
 (`phys_footprint`), not the larger resident-size figure `ps` prints, so the two agree.
 
+Sessions started from the **Claude desktop app** are listed too, as one row reading
+"Desktop session / Claude app". They run inside a virtual machine rather than as a process
+on your Mac, so there is no folder to show and the whole guest counts as a single entry,
+however many conversations are open inside it. Its memory is the VM's, which is a larger
+number than a CLI session's for the same reason. Quit the app and the row goes away.
+
 ![The panel: usage bars, extra usage and the list of running sessions](docs/panel.png)
 
 (The grey bars in the screenshots are folder names painted over, not a state the app has.)
@@ -162,18 +168,19 @@ Sources/
 Resources/
   claude-mark.png      the menu bar mark, copied into the .app at build time
 Tests/
-  main.swift           268 logic checks, `make test`
+  main.swift           292 logic checks, `make test`
 docs/                  the screenshots on this page (folder names painted over)
 build.sh               compiles both arches, lipos, bundles and ad-hoc signs the .app
 Makefile               build / test / install / run / zip / clean / uninstall
 ```
 
 `make test` compiles every source except `App.swift` together with `Tests/main.swift` into
-a plain command line binary and runs it: 268 checks in about a second. No XCTest and no
+a plain command line binary and runs it: 292 checks in about a second. No XCTest and no
 test target, for the same reason there is no Xcode project.
 
 It covers the parts that are easy to get quietly wrong: which processes count as an agent
-and how they are sorted, the severity thresholds, date and money formatting, the rows
+and how they are sorted, how the desktop app's virtual machine is told apart from any other
+one on the system, the severity thresholds, date and money formatting, the rows
 derived from the API response, how the decoder degrades when the response changes shape,
 the menu bar chips in every display mode, the whole 429 backoff (doubling, ceiling,
 `Retry-After` as a lower bound, the floor between requests), the status image's template
