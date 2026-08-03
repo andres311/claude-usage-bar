@@ -121,8 +121,19 @@ quarantine flag.
 
 The token is read at request time from the login keychain item `Claude Code-credentials`
 (falling back to `~/.claude/.credentials.json`), the same one the `claude` CLI uses. It is
-never written to disk or logged by this app. When it expires, the panel asks you to open
-Claude Code, which refreshes it; the app then picks up the new token automatically.
+never written to disk or logged by this app.
+
+That token lasts hours and only Claude Code renews it, when it next makes a request. So a
+stretch of not using `claude` is enough for it to lapse while you are still perfectly
+logged in, and the panel says so in those words: **"Waiting for Claude Code to refresh the
+login (token expired 12m ago)"**. Run any `claude` command and the next poll picks up the
+new token on its own. The shorter **"Session expired. Open Claude Code to refresh the
+login."** is the other case, a login refused while it should still have been valid.
+
+Once a token has been refused *and* is past its own expiry, the app stops sending requests
+with it: they can only come back `401` and would spend the rate-limit budget below for
+nothing. It starts again the moment the keychain holds a different token. A `401` on a
+token that should still be valid keeps being retried, since that one can be transient.
 
 ## Refresh rate
 
