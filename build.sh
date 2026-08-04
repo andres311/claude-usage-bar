@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 APP_NAME="ClaudeUsage"
 BUILD_DIR="build"
 APP="$BUILD_DIR/$APP_NAME.app"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
