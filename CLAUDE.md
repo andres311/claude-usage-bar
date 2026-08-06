@@ -72,6 +72,31 @@ The app is ad-hoc signed, not notarized, so a downloaded copy needs
 `@main` lives in `App.swift`, so the sources are compiled with `-parse-as-library`
 (no file may be named `main.swift`).
 
+## App icon
+
+`Resources/AppIcon.icns` is **committed**, and `Tools/MakeIcon/main.swift` (`make icon`)
+is what generates it from `Resources/claude-mark.png`. Keeping the product in git rather
+than generating it during `build.sh` is what keeps the build a two-second `swiftc` run and
+keeps `iconutil` off the critical path; `RESOURCES` in the Makefile lists the `.icns`, so
+replacing it still triggers a rebuild.
+
+- The generator is a throwaway CLI, so it is **top-level code in a file named
+  `main.swift`** compiled on its own. It cannot live in `Sources/`, which is
+  `-parse-as-library` and already has an `@main` (same constraint as `Tests/main.swift`).
+- `build.sh` copies the `.icns` next to the mark **before `codesign`**, for the same
+  reason the mark is: anything added after the signature is outside the seal and macOS
+  rejects the bundle. `CFBundleIconFile` is `AppIcon`, no extension.
+- The plate is **indigo (#6B66D9 -> #262454), deliberately not Claude's terracotta**. The
+  app is unofficial and says so; an icon in Anthropic's own brand color in the Dock says
+  the opposite. The mark itself is reused, which is what ties the icon to the status item.
+- Geometry is Apple's macOS grid - an 824 pt rounded square inset in a 1024 pt canvas,
+  corner radius 185.4 (22.5%) - so the icon sits at the same optical size as the stock
+  ones beside it. The contact shadow, the top highlight and the hairline rim are not
+  decoration: a flat gradient at 512 pt in Finder reads as a rectangle of paint.
+- The app is `LSUIElement`, so the icon never appears in the Dock or the switcher. It is
+  what Finder, Get Info, the login-items list and System Settings show, which is exactly
+  where an app with no window is otherwise anonymous.
+
 ## Screenshots
 
 `docs/*.png` are the three images the README embeds: `menu-bar.png` (the status item on

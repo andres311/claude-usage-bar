@@ -31,7 +31,10 @@ done
 lipo -create "${SLICES[@]}" -output "$APP/Contents/MacOS/$APP_NAME"
 rm -f "${SLICES[@]}"
 
+# Both the menu bar mark and the app icon, and both before codesign: anything copied in
+# afterwards is outside the seal and macOS rejects the bundle.
 cp Resources/*.png "$APP/Contents/Resources/"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,6 +45,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>Claude Usage</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
     <key>CFBundleIdentifier</key><string>com.andres.claudeusage</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>

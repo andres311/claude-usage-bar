@@ -7,11 +7,11 @@ APP := $(BUILD_DIR)/$(APP_NAME).app
 DEST := $(HOME)/Applications/$(APP_NAME).app
 ZIP := $(BUILD_DIR)/$(APP_NAME).zip
 SOURCES := $(wildcard Sources/*.swift)
-RESOURCES := $(wildcard Resources/*.png)
+RESOURCES := $(wildcard Resources/*.png) Resources/AppIcon.icns
 TESTS := $(BUILD_DIR)/tests
 
 .DEFAULT_GOAL := help
-.PHONY: build test install run stop zip clean uninstall help
+.PHONY: build test icon install run stop zip clean uninstall help
 
 ## build: compile build/ClaudeUsage.app
 # The echo is not decoration: without a recipe make answers an up-to-date .app with
@@ -38,6 +38,17 @@ $(TESTS): $(TEST_SOURCES) Tests/main.swift
 	@mkdir -p $(BUILD_DIR)
 	swiftc -o $(TESTS) $(TEST_SOURCES) Tests/main.swift \
 		-framework AppKit -framework SwiftUI -framework ServiceManagement
+
+## icon: regenerate Resources/AppIcon.icns (and docs/app-icon.png) from the mark
+# The .icns is committed, so this only needs running after touching the generator or the
+# mark. Tools/MakeIcon is top-level code, hence main.swift and its own compile.
+icon: Tools/MakeIcon/main.swift Resources/claude-mark.png
+	@mkdir -p $(BUILD_DIR)
+	swiftc -o $(BUILD_DIR)/makeicon Tools/MakeIcon/main.swift -framework AppKit
+	@$(BUILD_DIR)/makeicon $(BUILD_DIR)/AppIcon.iconset
+	iconutil -c icns $(BUILD_DIR)/AppIcon.iconset -o Resources/AppIcon.icns
+	@sips -Z 256 $(BUILD_DIR)/AppIcon-1024.png --out docs/app-icon.png >/dev/null
+	@echo "==> Resources/AppIcon.icns, docs/app-icon.png"
 
 ## install: build, copy to ~/Applications and launch
 install:
